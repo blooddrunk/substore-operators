@@ -578,12 +578,139 @@ urltest / load balance
 URLTest 只决定这个池里当前选谁。
 ```
 
+## VPS 部署与 daed 订阅超时（生产环境实录）
+
+**本节是实际生产部署的完整记录，中文为主维护；英文 README 仅保留摘要。**
+
+### 架构总览
+
+```text
+OpenWrt 路由器 (192.168.10.1)
+  daed 2026.08.13，7 个订阅，cron 10 */6 * * *
+        │  HTTPS（订阅更新，单次尝试硬编码 5s 超时）
+        ▼
+VPS 203.0.113.10（substore 与 bitsflow 节点同机）
+  1Panel openresty 容器（host 网络，监听 80/443）
+    └── substore.example.com 站点
+        └── proxy_cache（本节部署的下载缓存，HIT ≈ 30ms）
+              │ 未命中/过期时回源
+              ▼
+        sub-store 容器（xream/sub-store:http-meta，127.0.0.1:48238）
+          ① protocol-filter.js ② DNS Resolve ③ node-profile-filter.js
+          ④ google-region-probe.js（HTTP META + Mihomo，本仓库探测缓存）
+          ⑤ google-region-check.js
+              │ 拉取上游订阅
+              ▼
+        bwh / nosla / lightlayer / bitsflow 各 VPS 的订阅端点
+```
+
+### 为什么需要缓存层
+
+dae-wing（daed 后端）更新订阅的源码 `graphql/service/subscription/mutation_utils.go`：
+
+```go
+timeout := 10 * time.Second
+// 先直连 timeout/2 = 5s，失败再走路由 5s，均不可配置
+return nil, fmt.Errorf("%v (direct); %w (route)", err, err2)
+```
+
+对应 daed 前端的报错：
+
+```text
+Get "https://substore.../download/collection/MySub?...": context deadline exceeded
+(Client.Timeout exceeded while awaiting headers) (direct); ... (route)
+```
+
+实测 `collection/MySub` 生产耗时：探测缓存全命中时 ~0.5s；缓存过期（探测缓存 TTL 15 分钟，
+而 daed 每 6 小时更新，每次必然冷启动）或配置了 `http_meta_start_delay=3000` 时 5~7s。
+超过 5 秒 daed 必挂。修复共三层：
+
+1. **Operator 层**（本仓库，已生效）：`unknown` 探测结果短 TTL 缓存（`unknown_cache_ttl`，
+   默认 10 分钟，`0` 恢复旧行为）；探测异常回退最近一次任意类型缓存结果。
+2. **openresty 层**（VPS，已部署）：`proxy_cache` + stale-while-revalidate，详见下节。
+3. **保热 cron**（VPS，已部署）：每 5 分钟刷新缓存，daed 的 6 小时定时任务永远命中热缓存。
+
+### openresty 下载缓存部署细节
+
+配置模板：[configs/openresty-substore-cache.conf](./configs/openresty-substore-cache.conf)。
+1Panel 的 openresty 容器为 host 网络（能直接访问宿主机 `127.0.0.1:48238`），两个文件：
+
+```text
+① /opt/1panel/www/conf.d/substore-cache.conf
+   （→ 容器 conf.d，随 nginx.conf http{} include 生效）
+   proxy_cache_path /www/cache/substore ... keys_zone=substore_cache
+
+② /opt/1panel/www/sites/substore.example.com/proxy/download.conf
+   （→ 站点 server{} include 的 proxy/*.conf）
+   location ^~ /PATH_TOKEN/download/ { proxy_cache ... }
+```
+
+要点：
+
+- 缓存目录放 `/www/cache/substore`（宿主机 `/opt/1panel/www/cache/substore`），随 1Panel
+  数据卷持久化；openresty 容器被 watchtower 重建后目录仍在，避免 nginx 因缺目录启动失败。
+- `proxy_cache_key "$scheme$proxy_host$request_uri"`：不同 `$options` 变体独立缓存。
+- `proxy_cache_lock on`：收拢 daed 同一秒并发更新 7 个订阅造成的回源风暴。
+- `proxy_cache_background_update on` + `proxy_cache_use_stale ... updating http_500 ...`：
+  过期先回旧值再后台刷新；上游慢或瞬时 500 永不透传给 daed。
+- `location ^~ /PATH_TOKEN...` 最长前缀优先，覆盖原有 `root.conf` 的 `location ^~ /`，
+  其余路径（Sub-Store 管理界面等）仍走原配置。
+
+生效与验证：
+
+```bash
+docker exec openresty-container nginx -t
+docker exec openresty-container nginx -s reload
+
+# 首次 MISS（可能 5~6s，被 openresty 吸收），之后 HIT ≈ 30ms
+curl -sI 'https://substore.example.com/PATH_TOKEN/download/bwh' | grep -i x-cache-status
+```
+
+`X-Cache-Status` 含义：`MISS` 回源 / `HIT` 命中 / `STALE` 旧值后台刷新中 /
+`UPDATING` 后台刷新期间 / `BYPASS` 未走缓存（路径不匹配时检查 location）。
+
+### 保热 cron
+
+脚本：[configs/keepwarm.sh](./configs/keepwarm.sh)。
+
+```bash
+cp configs/keepwarm.sh /usr/local/bin/substore-keepwarm.sh && chmod +x /usr/local/bin/substore-keepwarm.sh
+( crontab -l; echo '*/5 * * * * /usr/local/bin/substore-keepwarm.sh >/dev/null 2>&1' ) | crontab -
+```
+
+### Sub-Store 中 google-region-probe.js 的推荐参数
+
+`http_meta_start_delay=3000` 一项就占掉 daed 5s 预算的 60%，建议 1500（默认值）：
+
+```text
+api=https%3A%2F%2Fwww.youtube.com%2Fpremium&concurrency=5&http_meta_start_delay=1500&share_by_server=true&timeout=10000
+```
+
+`share_by_server=true` 建议保留：同一 VPS 的多个入站共享同一出站路径，可合并探测。
+
+### 证书与面板访问（bitsflow VPS 实录）
+
+- 3x-ui 面板 `:28339`（路径 `/PATH_TOKEN/`）、订阅服务 `:2096`（路径 `/PATH_TOKEN/`）
+  均使用 `/root/cert/bitsflow.example.com/` 的 Let's Encrypt 证书（含 `*.bitsflow.example.com` 泛域名 SAN）。
+- 续期由 VPS 上的 acme.sh cron（`12 2,8,14,20 * * *`，Cloudflare DNS-01）全自动完成，
+  与 1Panel 各管各的证书目录，互不冲突；DNS-01 也不需要抢占 80 端口。
+- **必须用域名访问**：`https://bitsflow.example.com:28339/...`。若用 IP 访问
+  （`https://203.0.113.10:28339`），证书 SAN 只有域名，Chrome 报
+  `ERR_CERT_COMMON_NAME_INVALID`——证书本身没有问题。
+- `https://bitsflow.example.com/`（443 端口）会被 openresty 以 `unrecognized name` 拒绝：
+  443 上只有 substore / panel3 / hs-bitsflow 三个站点，没有 bitsflow 裸域名的站点。
+
 ## 仓库结构
 
 ```text
 .
 ├── README.md
 ├── README.zh-CN.md
+├── configs/
+│   ├── README.md（节点档案与部署说明）
+│   ├── node-profile-rules.json
+│   ├── openresty-substore-cache.conf（VPS 下载缓存模板）
+│   └── keepwarm.sh（VPS 保热脚本）
 ├── examples/
 │   └── node-profile-rules.example.json
 └── operators/

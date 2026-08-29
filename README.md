@@ -492,12 +492,29 @@ You decide which pool a node belongs to.
 URLTest only decides which node wins inside that pool now.
 ```
 
+## Production deployment & the daed 5s subscription timeout
+
+> Full production runbook (architecture, openresty cache deployment on the 1Panel VPS, keep-warm cron, certificate notes) is maintained in Chinese in [README.zh-CN.md](./README.zh-CN.md) — that file is authoritative.
+
+daed (dae-wing) updates subscriptions with a **hard-coded 5s timeout per attempt** (direct, then routed) and no configuration option. A Sub-Store download that exceeds 5s fails with `context deadline exceeded ... (direct); ... (route)`. Since the Google probe cache TTL (15 min) is always expired by the 6-hourly daed cron, cold productions regularly blew that budget. Fixes:
+
+1. **Operator** (`google-region-probe.js`): `unknown` verdicts cached for `unknown_cache_ttl` (default 10 min) alongside `clean`/`cn` for `cache_ttl`; failed probes fall back to the latest cached verdict of any kind.
+2. **openresty `proxy_cache`** on the VPS in front of Sub-Store ([configs/openresty-substore-cache.conf](./configs/openresty-substore-cache.conf)): stale-while-revalidate, cache lock, and upstream 5xx/timeout never passed through. Warm responses answer in ~30ms.
+3. **Keep-warm cron** ([configs/keepwarm.sh](./configs/keepwarm.sh)) every 5 minutes so daed always meets a warm cache.
+
+Recommended Sub-Store script args: drop `http_meta_start_delay` to `1500` (3000 alone eats 60% of the budget); keep `share_by_server=true` for same-VPS inbounds.
+
 ## Repository layout
 
 ```text
 .
 ├── README.md
 ├── README.zh-CN.md
+├── configs/
+│   ├── README.md
+│   ├── node-profile-rules.json
+│   ├── openresty-substore-cache.conf
+│   └── keepwarm.sh
 ├── examples/
 │   └── node-profile-rules.example.json
 └── operators/
