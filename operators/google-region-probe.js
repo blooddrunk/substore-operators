@@ -2,10 +2,15 @@
  * Probe Google/YouTube region behavior through every proxy using HTTP META.
  *
  * Specialized for the Google "送中" check:
- * - 2xx response: keep the response body in `_geo` for google-region-check.js.
- * - YouTube/Google consent redirect with an explicit non-CN `gl`: mark clean.
- * - Redirect to google.cn, or consent with gl=CN: mark CN.
- * - Other failures / redirects: leave `_geo` unset => unknown.
+ * - 2xx body containing www.google.cn => cn.
+ * - Other successful 2xx responses => clean.
+ * - YouTube/Google consent redirect with an explicit non-CN `gl` => clean.
+ * - Redirect to google.cn, or consent with gl=CN => cn.
+ * - Other failures / redirects => unknown.
+ *
+ * The probe writes `_googleStatus` explicitly for google-region-check.js and
+ * keeps `_geo` only when a response body is available, for compatibility and
+ * debugging.
  *
  * Hysteria2 `ports` is removed only from the temporary HTTP META probe copy.
  * The original subscription node remains unchanged.
@@ -121,7 +126,8 @@ async function operator(proxies = [], targetPlatform, context) {
 
   async function check(proxy, internalIndex) {
     const originalIndex = proxy._proxies_index
-    const name = proxies[originalIndex]?.name || proxy.name || String(originalIndex)
+    const original = proxies[originalIndex]
+    const name = original?.name || proxy.name || String(originalIndex)
     const startedAt = Date.now()
 
     try {
@@ -133,29 +139,24 @@ async function operator(proxies = [], targetPlatform, context) {
       })
 
       const latency = Date.now() - startedAt
+      original._googleStatus = result.kind
 
-      if (result.kind === 'ok') {
-        proxies[originalIndex]._geo = result.body
-        $.info(`[${name}] status: ${result.statusCode}, latency: ${latency}`)
-        return
+      if (result.body !== undefined) {
+        original._geo = result.body
       }
 
-      if (result.kind === 'consent') {
-        proxies[originalIndex]._geo = `__YOUTUBE_CONSENT_REGION__:${result.region}`
+      if (result.kind === 'clean' && result.region) {
         $.info(
-          `[${name}] status: ${result.statusCode}, consent-region: ${result.region}, latency: ${latency}`
+          `[${name}] status: ${result.statusCode}, verdict: clean, consent-region: ${result.region}, latency: ${latency}`
         )
         return
       }
 
-      if (result.kind === 'cn') {
-        proxies[originalIndex]._geo = '__GOOGLE_CN__:www.google.cn'
-        $.info(`[${name}] status: ${result.statusCode}, verdict: cn, latency: ${latency}`)
-        return
-      }
-
-      $.info(`[${name}] status: ${result.statusCode}, verdict: unknown, latency: ${latency}`)
+      $.info(
+        `[${name}] status: ${result.statusCode}, verdict: ${result.kind}, latency: ${latency}`
+      )
     } catch (e) {
+      original._googleStatus = 'unknown'
       $.error(`[${name}] ${e.message ?? e}`)
     }
   }
@@ -175,7 +176,11 @@ async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout }) {
     const { statusCode, redirectUrl, body } = response
 
     if (statusCode >= 200 && statusCode < 300) {
-      return { kind: 'ok', statusCode, body }
+      if (/www\.google\.cn/i.test(body)) {
+        return { kind: 'cn', statusCode, body }
+      }
+
+      return { kind: 'clean', statusCode, body }
     }
 
     if (statusCode >= 300 && statusCode < 400) {
@@ -187,7 +192,7 @@ async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout }) {
       const hostname = nextUrl.hostname.toLowerCase()
 
       if (hostname === 'google.cn' || hostname.endsWith('.google.cn')) {
-        return { kind: 'cn', statusCode }
+        return { kind: 'cn', statusCode, body: nextUrl.toString() }
       }
 
       if (hostname === 'consent.youtube.com' || hostname === 'consent.google.com') {
@@ -196,14 +201,15 @@ async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout }) {
           .toUpperCase()
 
         if (region === 'CN') {
-          return { kind: 'cn', statusCode }
+          return { kind: 'cn', statusCode, body: nextUrl.toString() }
         }
 
         if (region) {
           return {
-            kind: 'consent',
+            kind: 'clean',
             statusCode,
             region,
+            body: `__YOUTUBE_CONSENT_REGION__:${region}`,
           }
         }
 
@@ -238,8 +244,6 @@ function curlOnce({ proxyHost, proxyPort, url, timeout }) {
     String(timeoutSeconds),
     '--user-agent',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
-    '--header',
-    'Cookie: SOCS=CAI',
     '--header',
     'Accept-Encoding: identity',
     '--output',
