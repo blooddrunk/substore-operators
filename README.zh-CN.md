@@ -30,23 +30,9 @@ https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/p
 
 > 当前 `reality` 只是 `vless` 的别名。脚本暂时不会进一步检查 VLESS 节点是否真的使用 Reality。
 
-参数优先级：
-
-```text
-$options > $arguments > 默认值
-```
-
-默认参数：
-
-```text
-filterType=all
-```
-
 ### `http-meta-geo.js`
 
-Fork 自 xream 的 `http_meta_geo.js`，负责通过 HTTP META / Mihomo 让每个节点实际访问检测 URL。
-
-本仓库只做一项行为修改：**Hysteria2 在进入 HTTP META 检测前，会在临时检测副本中删除 `ports`，强制使用主 `port`。原始节点及最终订阅中的端口跳跃配置完全不变。**
+Fork 自 xream 的 `http_meta_geo.js`。主要保留上游通用能力，同时针对本仓库的 Hysteria2 节点做了一项兼容处理：**进入 HTTP META 检测前，仅在临时检测副本中删除 `ports`，强制使用主 `port`。原始节点和最终订阅中的端口跳跃配置完全不变。**
 
 远程脚本地址：
 
@@ -54,19 +40,35 @@ Fork 自 xream 的 `http_meta_geo.js`，负责通过 HTTP META / Mihomo 让每�
 https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/http-meta-geo.js
 ```
 
-Google「送中」检测使用：
+### `google-region-probe.js`
+
+当前推荐的 Google「送中」专用探测器。
+
+它会通过 HTTP META / Mihomo 为每个节点创建本地代理端口，再使用容器中的 `curl` 访问：
 
 ```text
-api=https://www.youtube.com/premium
-geo=true
-format={{proxy.name}}
+https://www.youtube.com/premium
 ```
 
-经过实际测试，Reality 和带 `ports` 端口跳跃的 Hysteria2 均可以通过该 fork 正常完成探测。
+特点：
+
+- Reality 和 Hysteria2 都通过 HTTP META 实际出站。
+- Hysteria2 只在检测副本中临时删除 `ports`。
+- `curl` 不自动跟随重定向，避免欧洲节点陷入 YouTube consent 重定向循环。
+- 2xx 页面正文包含 `www.google.cn` -> `cn`。
+- 明确的非 CN consent region -> `clean`。
+- 无法可靠判断的网络错误或异常响应 -> `unknown`。
+- 探测结果写入 `_googleStatus=clean|cn|unknown`，供下一步过滤。
+
+远程脚本地址：
+
+```text
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-probe.js
+```
 
 ### `google-region-check.js`
 
-读取 `http-meta-geo.js` 写入的 `_geo` 响应正文，根据 `www.google.cn` 特征将节点分成三个状态，并可直接过滤。
+读取 `google-region-probe.js` 写入的 `_googleStatus` 并过滤节点；如果 `_googleStatus` 不存在，则兼容旧 `_geo` + `www.google.cn` 判断方式。
 
 远程脚本地址：
 
@@ -79,28 +81,30 @@ https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/g
 | 参数 | 含义 |
 | --- | --- |
 | `all` | 保留全部节点（默认） |
-| `clean` | 仅保留成功检测且未出现 `www.google.cn` 的节点 |
+| `clean` | 仅保留明确检测为正常的节点 |
 | `ok` | `clean` 的别名 |
-| `cn` | 仅保留命中 `www.google.cn` 的节点 |
+| `non-cn` | 保留除明确 `cn` 以外的节点，即 `clean + unknown` |
+| `cn` | 仅保留明确检测为「送中」的节点 |
 | `china` | `cn` 的别名 |
 | `unknown` | 仅保留无法可靠判断的节点 |
 
-分类规则：
+两个常用生产策略：
 
 ```text
-_geo 不存在 / null / undefined / 空内容
-    -> unknown
-
-_geo 包含 www.google.cn
-    -> cn
-
-其余非空 _geo
-    -> clean
+googleStatus=clean
 ```
 
-分类完成后脚本会删除 `_geo`，避免把整段 YouTube Premium HTML 带入最终订阅。
+严格模式：只有成功确认正常的节点才保留；瞬时网络失败也会被删除。
 
-> `www.google.cn` 检测属于经验性判据，不是 Google 官方 API。本方案已经用已知「送中」节点进行了正向验证，但仍应将网络失败保留为 `unknown`，而不是误判为 `clean`。
+```text
+googleStatus=non-cn
+```
+
+保守剔除模式：只删除明确判定为 `cn` 的节点，`unknown` 不会因为一次探测失败而被误删。
+
+分类完成后脚本会删除 `_geo` 和 `_googleStatus`，检测元数据不会进入最终订阅。
+
+> `www.google.cn` 属于经验性判据，并非 Google 官方 API。网络失败必须与 `cn` 分开处理，因此始终保留 `unknown` 状态。
 
 ## 推荐的 Sub-Store 处理链路
 
@@ -112,32 +116,12 @@ _geo 包含 www.google.cn
 │ ① protocol-filter.js         │
 │                              │
 │ 筛选 VLESS / Hysteria2       │
-│ 保护 Hysteria2 SNI           │
+│ 在 server 变成 IP 前保护 SNI │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
-│ ② http-meta-geo.js           │
-│                              │
-│ 通过每个节点访问：           │
-│ youtube.com/premium          │
-│                              │
-│ HY2 检测副本临时删除 ports   │
-│ geo=true -> 写入 _geo        │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ ③ google-region-check.js     │
-│                              │
-│ clean / cn / unknown         │
-│ 推荐：googleStatus=clean     │
-│ 删除检测用 _geo              │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ ④ 域名解析 Action            │
+│ ② 域名解析 Action            │
 │                              │
 │ DNS：Cloudflare              │
 │ IP：IPv4                     │
@@ -147,10 +131,43 @@ _geo 包含 www.google.cn
 └──────────────┬───────────────┘
                │
                ▼
+┌──────────────────────────────┐
+│ ③ google-region-probe.js     │
+│                              │
+│ 检测最终实际使用的 server IP │
+│ clean / cn / unknown         │
+│ HY2 检测副本临时删除 ports   │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ ④ google-region-check.js     │
+│                              │
+│ 严格：googleStatus=clean     │
+│ 保守：googleStatus=non-cn    │
+│ 清理检测元数据               │
+└──────────────┬───────────────┘
+               │
+               ▼
             输出订阅
 ```
 
-执行顺序很重要：Google 检测应在域名解析之前完成，以原始节点配置进行实际连通性测试；随后再把节点域名转换成 IP。
+### 为什么域名解析放在 Google 检测之前
+
+对于本仓库的使用场景，这个顺序更合理：最终订阅本来就会把节点 `server` 固定成解析后的 IP，因此 Google 探测最好验证**最终真正会输出并使用的连接配置**。
+
+如果先用域名做 Google 探测、之后再执行 DNS Resolve，那么在域名存在多个 A 记录、DNS 缓存变化或解析结果变化时，探测阶段使用的入口 IP 与最终订阅固定下来的 IP 理论上可能不同。
+
+因此推荐：
+
+```text
+协议过滤 / 保存 SNI
+    -> DNS Resolve
+    -> Google 探测
+    -> Google 过滤
+```
+
+唯一重要的前提是：**DNS Resolve 之前必须保存 TLS 所需的主机名。** `protocol-filter.js` 已为没有显式 SNI 的 Hysteria2 节点完成这一步；Reality/VLESS 节点本身的 TLS/Reality SNI 等字段则继续保留。
 
 ## 可直接使用的配置
 
@@ -160,44 +177,44 @@ _geo 包含 www.google.cn
 https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/protocol-filter.js#filterType=all
 ```
 
-### 2. Google 探测
+### 2. 域名解析
+
+建议继续使用现有配置：Cloudflare、IPv4、IP only、TLS validation enabled、缓存 300～600 秒。
+
+### 3. Google 探测
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/http-meta-geo.js#http_meta_protocol=http&http_meta_host=127.0.0.1&http_meta_port=9876&http_meta_start_delay=3000&http_meta_proxy_timeout=10000&api=https%3A%2F%2Fwww.youtube.com%2Fpremium&geo=true&format=%7B%7Bproxy.name%7D%7D&concurrency=1&timeout=10000&retries=0
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-probe.js#http_meta_protocol=http&http_meta_host=127.0.0.1&http_meta_port=9876&http_meta_start_delay=3000&http_meta_proxy_timeout=10000&api=https%3A%2F%2Fwww.youtube.com%2Fpremium&concurrency=1&timeout=10000
 ```
 
-这里必须保留：
+### 4. Google 过滤
 
-```text
-geo=true
-format={{proxy.name}}
-```
-
-`geo=true` 用于将响应写入 `_geo`，供下一步判断；`format={{proxy.name}}` 用于避免上游脚本修改节点名。
-
-### 3. 只保留 Google 未「送中」节点
+只保留明确正常节点：
 
 ```text
 https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js#googleStatus=clean
 ```
 
-排查时也可以分别查看：
+只剔除明确「送中」节点，保留 `clean + unknown`：
+
+```text
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js#googleStatus=non-cn
+```
+
+排查时：
 
 ```text
 googleStatus=cn
 googleStatus=unknown
+googleStatus=all
 ```
-
-### 4. 域名解析
-
-建议继续使用现有配置：Cloudflare、IPv4、IP only、TLS validation enabled、缓存 300～600 秒。
 
 ## Hysteria2 SNI 与端口跳跃
 
 这两个处理属于不同阶段：
 
 - `protocol-filter.js`：在 `server` 被 DNS Resolve 改为 IP 前保存正确 SNI。
-- `http-meta-geo.js`：只在 HTTP META 检测副本中移除 `ports`，绕过检测阶段对端口跳跃的兼容问题。
+- `google-region-probe.js` / `http-meta-geo.js`：只在 HTTP META 检测副本中移除 `ports`，绕过检测阶段对端口跳跃的兼容问题。
 
 最终输出的 Hysteria2 节点仍然保留原来的：
 
@@ -207,7 +224,7 @@ ports
 sni
 ```
 
-不会因为 Google 检测而丢失正式连接所需的端口跳跃配置。
+不会因为 DNS Resolve 或 Google 检测而丢失正式连接所需的端口跳跃与 TLS 主机名配置。
 
 ## 仓库结构
 
@@ -218,12 +235,13 @@ sni
 └── operators/
     ├── protocol-filter.js
     ├── http-meta-geo.js
+    ├── google-region-probe.js
     └── google-region-check.js
 ```
 
 ## 开发约定
 
-- 每个远程脚本尽量保持完全自包含，不依赖 npm 包运行。
+- 每个远程脚本尽量保持自包含；若使用系统工具，应明确运行环境要求。
 - 所有可配置行为提供明确默认值。
 - 参数别名在文档中明确说明。
 - 除非转换本身有必要，否则保留节点原始字段。
