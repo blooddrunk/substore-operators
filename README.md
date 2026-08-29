@@ -28,19 +28,65 @@ Supported `filterType` values:
 | `hysteria2` | Hysteria2 only |
 | `hy2` | Alias of `hysteria2` |
 
-> `reality` is intentionally only an alias of `vless` at the moment. The script does **not** inspect VLESS Reality-specific fields. This matches the current subscription, where the VLESS nodes are Reality nodes.
+### `http-meta-geo.js`
 
-Parameter priority:
+Forked from xream's `http_meta_geo.js`. It uses HTTP META / Mihomo to access the probe URL through every node.
 
-```text
-$options > $arguments > defaults
-```
+This fork has one behavior change: **for Hysteria2 probes, `ports` is removed only from the temporary probe copy, forcing HTTP META to use the primary `port`. The original node and final subscription keep the configured port-hopping range unchanged.**
 
-Default:
+Remote script URL:
 
 ```text
-filterType=all
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/http-meta-geo.js
 ```
+
+Google-region probing uses:
+
+```text
+api=https://www.youtube.com/premium
+geo=true
+format={{proxy.name}}
+```
+
+The fork has been validated with both Reality and Hysteria2 nodes, including Hysteria2 nodes that retain `ports` in the actual subscription.
+
+### `google-region-check.js`
+
+Reads the `_geo` response produced by `http-meta-geo.js`, classifies the node into one of three states, and optionally filters the subscription.
+
+Remote script URL:
+
+```text
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js
+```
+
+Supported `googleStatus` values:
+
+| Value | Result |
+| --- | --- |
+| `all` | Keep all nodes (default) |
+| `clean` | Keep successful probes that do not contain `www.google.cn` |
+| `ok` | Alias of `clean` |
+| `cn` | Keep probes containing `www.google.cn` |
+| `china` | Alias of `cn` |
+| `unknown` | Keep nodes without a reliable probe result |
+
+Classification:
+
+```text
+_geo missing / null / undefined / empty
+    -> unknown
+
+_geo contains www.google.cn
+    -> cn
+
+other non-empty _geo
+    -> clean
+```
+
+After classification, `_geo` is removed so the complete YouTube Premium HTML response cannot bloat the final subscription.
+
+> `www.google.cn` is a heuristic rather than an official Google API. It has been positively validated against a known affected node, but transport failures are deliberately kept as `unknown` rather than being treated as clean.
 
 ## Recommended Sub-Store pipeline
 
@@ -51,17 +97,33 @@ filterType=all
 ┌──────────────────────────────┐
 │ ① protocol-filter.js         │
 │                              │
-│ Protocol filtering:          │
-│   all   → VLESS + HY2        │
-│   vless → VLESS              │
-│   hy2   → Hysteria2          │
-│                              │
+│ Filter VLESS / Hysteria2     │
 │ Preserve Hysteria2 SNI       │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
-│ ② DNS Resolve Action         │
+│ ② http-meta-geo.js           │
+│                              │
+│ Probe through each node:     │
+│ youtube.com/premium          │
+│                              │
+│ HY2 probe copy drops ports   │
+│ geo=true -> attach _geo      │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ ③ google-region-check.js     │
+│                              │
+│ clean / cn / unknown         │
+│ Recommended: clean           │
+│ Remove probe-only _geo       │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ ④ DNS Resolve Action         │
 │                              │
 │ Resolver: Cloudflare         │
 │ IP family: IPv4              │
@@ -74,29 +136,56 @@ filterType=all
         subscription output
 ```
 
-The order matters. For Hysteria2 nodes without explicit `sni` / `servername`, the operator copies the original hostname into `sni` **before** DNS resolution changes `server` to an IP. This keeps TLS certificate verification tied to the original hostname.
+The order matters: run the Google probe before DNS resolution so the original node configuration is tested; transform hostnames to IPs only after classification.
 
-## Behavior and safety
+## Copy-ready configuration
 
-- Only VLESS and Hysteria2 are retained when `filterType=all`; `all` does not mean every protocol.
-- Existing `sni` or `servername` values are never overwritten.
-- An SNI value is inferred only when `server` looks like a hostname rather than an IP address.
-- The operator returns a new object only when it needs to add inferred SNI, avoiding unnecessary mutation of the original node.
-- Unknown `filterType` values fail fast with a clear error instead of silently returning an unexpected subscription.
+### 1. Protocol filter
 
-## Planned operators
+```text
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/protocol-filter.js#filterType=all
+```
 
-### Google region / "送中" detection
+### 2. Google probe
 
-The next operator can probe Google through each node and classify it before output/grouping. It should use **three states**, not a simple boolean:
+```text
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/http-meta-geo.js#http_meta_protocol=http&http_meta_host=127.0.0.1&http_meta_port=9876&http_meta_start_delay=3000&http_meta_proxy_timeout=10000&api=https%3A%2F%2Fwww.youtube.com%2Fpremium&geo=true&format=%7B%7Bproxy.name%7D%7D&concurrency=1&timeout=10000&retries=0
+```
 
-- `clean` — Google behaves as expected / not redirected to mainland China handling.
-- `cn` — confirmed mainland-China redirect or equivalent positive signal.
-- `unknown` — timeout, TLS failure, transport failure, ambiguous HTTP response, or any other result that cannot safely be classified.
+Keep both of these parameters:
 
-Keeping `unknown` separate is important: a broken node or transient Google failure should never be treated as either definitely clean or definitely "送中".
+```text
+geo=true
+format={{proxy.name}}
+```
 
-A future implementation can optionally add a prefix/suffix to node names or expose separate filtered outputs for these states.
+`geo=true` exposes the response to the classifier as `_geo`; `format={{proxy.name}}` prevents the upstream script from renaming nodes.
+
+### 3. Keep only clean Google nodes
+
+```text
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js#googleStatus=clean
+```
+
+For diagnostics:
+
+```text
+googleStatus=cn
+googleStatus=unknown
+```
+
+### 4. DNS resolution
+
+Continue with the existing Cloudflare / IPv4 / IP-only / TLS-validation-enabled configuration and a 300–600 second DNS cache.
+
+## Hysteria2 SNI and port hopping
+
+These are handled at different stages:
+
+- `protocol-filter.js` preserves SNI before DNS resolution replaces the hostname.
+- `http-meta-geo.js` removes `ports` only from the HTTP META probe copy to work around probe-time port-hopping compatibility.
+
+The final Hysteria2 node still keeps its real `port`, `ports`, and `sni` fields.
 
 ## Repository layout
 
@@ -105,15 +194,18 @@ A future implementation can optionally add a prefix/suffix to node names or expo
 ├── README.md
 ├── README.zh-CN.md
 └── operators/
-    └── protocol-filter.js
+    ├── protocol-filter.js
+    ├── http-meta-geo.js
+    └── google-region-check.js
 ```
 
 ## Development conventions
 
-- Keep every remote script self-contained; do not require npm dependencies at runtime.
+- Keep remote scripts self-contained; do not require npm dependencies at runtime.
 - Prefer explicit defaults and documented aliases.
 - Preserve existing proxy fields unless a transformation is required.
 - Treat network-based detection as fallible and retain an `unknown` state.
+- Remove probe-only metadata before final subscription output.
 - Keep stable filenames once they are referenced by Sub-Store remote-script URLs.
 
 ## Upstream
