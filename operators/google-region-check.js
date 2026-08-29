@@ -11,6 +11,7 @@
  * googleStatus:
  *   all      - keep all nodes (default)
  *   clean    - keep nodes classified clean
+ *   non-cn   - keep every node except those explicitly classified cn
  *   cn       - keep nodes classified cn
  *   unknown  - keep nodes without a reliable probe result
  *
@@ -41,6 +42,7 @@ const STATUS_ALIASES = Object.freeze({
   all: 'all',
   clean: 'clean',
   ok: 'clean',
+  'non-cn': 'non-cn',
   cn: 'cn',
   china: 'cn',
   unknown: 'unknown',
@@ -56,7 +58,7 @@ function normalizeGoogleStatus(value) {
   if (!result) {
     throw new Error(
       `Unknown googleStatus: ${value}. ` +
-      'Expected: all, clean, ok, cn, china, unknown'
+      'Expected: all, clean, ok, non-cn, cn, china, unknown'
     );
   }
 
@@ -106,7 +108,15 @@ function classifyGoogleStatus(proxy) {
 }
 
 function shouldKeep(status) {
-  return googleStatus === 'all' || status === googleStatus;
+  if (googleStatus === 'all') {
+    return true;
+  }
+
+  if (googleStatus === 'non-cn') {
+    return status !== 'cn';
+  }
+
+  return status === googleStatus;
 }
 
 function operator(proxies = []) {
