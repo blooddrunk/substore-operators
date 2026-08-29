@@ -23,6 +23,10 @@
  *   rules=<JSON array>
  *   rulesUrl=<URL returning a JSON array, or {"rules":[...]}>
  *
+ * Remote rule cache:
+ *   rulesCacheTtl=<milliseconds>, default 900000 (15 minutes)
+ *   Fresh cache avoids a network request. If refresh fails, stale cache is used.
+ *
  * Canonical rule format:
  *   {
  *     "match": { "host": "node.example.com" },
@@ -227,6 +231,56 @@ function parseRulesPayload(value, source = 'rules') {
   return parsed.map((rule, index) => normalizeRule(rule, index, source));
 }
 
+function rulesCacheKey(url) {
+  return `#node-profile-rules:${encodeURIComponent(url)}`;
+}
+
+function readRulesCache(url) {
+  if (
+    typeof $substore === 'undefined' ||
+    typeof $substore.read !== 'function'
+  ) {
+    return null;
+  }
+
+  try {
+    const raw = $substore.read(rulesCacheKey(url));
+    if (!raw) return null;
+
+    const cached = JSON.parse(raw);
+    if (
+      !cached ||
+      !Number.isFinite(Number(cached.time)) ||
+      typeof cached.body !== 'string'
+    ) {
+      return null;
+    }
+
+    return {
+      time: Number(cached.time),
+      body: cached.body,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeRulesCache(url, body) {
+  if (
+    typeof $substore === 'undefined' ||
+    typeof $substore.write !== 'function'
+  ) {
+    return;
+  }
+
+  try {
+    $substore.write(
+      JSON.stringify({ time: Date.now(), body: String(body ?? '') }),
+      rulesCacheKey(url)
+    );
+  } catch (_) {}
+}
+
 async function loadRulesFromUrl() {
   const url = String(options.rulesUrl ?? options.rules_url ?? '').trim();
   if (!url) return [];
@@ -242,14 +296,39 @@ async function loadRulesFromUrl() {
   const timeout = parseFloat(
     options.rulesTimeout ?? options.rules_timeout ?? 10000
   );
-  const response = await $substore.http.get({ url, timeout });
-  const status = parseInt(response?.status ?? response?.statusCode ?? 200);
+  const cacheTtl = Math.max(
+    0,
+    parseFloat(options.rulesCacheTtl ?? options.rules_cache_ttl ?? 900000)
+  );
+  const cached = readRulesCache(url);
 
-  if (status < 200 || status >= 300) {
-    throw new Error(`rulesUrl request failed with HTTP ${status}`);
+  if (cached && cacheTtl > 0 && Date.now() - cached.time <= cacheTtl) {
+    return parseRulesPayload(cached.body, 'rulesUrl cache');
   }
 
-  return parseRulesPayload(response?.body ?? '', 'rulesUrl');
+  try {
+    const response = await $substore.http.get({ url, timeout });
+    const status = parseInt(response?.status ?? response?.statusCode ?? 200);
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`rulesUrl request failed with HTTP ${status}`);
+    }
+
+    const body = response?.body ?? '';
+    const rules = parseRulesPayload(body, 'rulesUrl');
+    if (cacheTtl > 0) writeRulesCache(url, body);
+    return rules;
+  } catch (error) {
+    if (cached) {
+      if (typeof $substore.error === 'function') {
+        $substore.error(
+          `rulesUrl refresh failed; using stale cache: ${error.message ?? error}`
+        );
+      }
+      return parseRulesPayload(cached.body, 'rulesUrl stale cache');
+    }
+    throw error;
+  }
 }
 
 function matchString(actual, expected, normalizer = normalizeLower) {
@@ -263,7 +342,7 @@ function matchString(actual, expected, normalizer = normalizeLower) {
 }
 
 function matchRegex(actual, pattern) {
-  if (pattern === undefined || pattern === null || pattern === '') return true;
+  if (expected === undefined || expected === null || expected === '') return true;
   try {
     return new RegExp(String(pattern), 'i').test(String(actual ?? ''));
   } catch (error) {
