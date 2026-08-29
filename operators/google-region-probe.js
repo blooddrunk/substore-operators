@@ -15,9 +15,8 @@
  * Hysteria2 `ports` is removed only from the temporary HTTP META probe copy.
  * The original subscription node remains unchanged.
  *
- * The actual probe uses the container's curl binary through the temporary
- * HTTP META local proxy. curl does not follow redirects here; redirects are
- * inspected and followed explicitly by this script.
+ * Successful `clean` / `cn` results are cached in Sub-Store storage. Fresh
+ * cache entries skip HTTP META entirely. `unknown` is never cached.
  */
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -37,12 +36,22 @@ async function operator(proxies = [], targetPlatform, context) {
   const proxyTimeout = parseFloat($arguments.http_meta_proxy_timeout ?? 10000)
   const requestTimeout = parseFloat($arguments.timeout ?? 10000)
   const concurrency = Math.max(1, parseInt($arguments.concurrency || 10))
+  const cacheTtl = Math.max(0, parseFloat($arguments.cache_ttl ?? 900000))
   const includeUnsupportedProxy = $arguments.include_unsupported_proxy
   const url = $arguments.api || 'https://www.youtube.com/premium'
 
   const internalProxies = []
+  let cacheHits = 0
 
   proxies.forEach((proxy, index) => {
+    const cached = readProbeCache(proxy, url)
+
+    if (cached && cacheTtl > 0 && Date.now() - cached.time <= cacheTtl) {
+      applyProbeResult(proxy, cached.result)
+      cacheHits++
+      return
+    }
+
     try {
       const probeProxy = { ...proxy }
 
@@ -57,12 +66,20 @@ async function operator(proxies = [], targetPlatform, context) {
       })?.[0]
 
       if (node) {
-        internalProxies.push({ ...node, _proxies_index: index })
+        internalProxies.push({
+          ...node,
+          _proxies_index: index,
+          _stale_google_cache: cached,
+        })
       }
     } catch (e) {
       $.error(`[${proxy?.name || index}] ${e.message ?? e}`)
     }
   })
+
+  if (cacheHits) {
+    $.info(`Google probe cache hit: ${cacheHits}/${proxies.length}`)
+  }
 
   $.info(`Google probe 核心支持节点数: ${internalProxies.length}/${proxies.length}`)
   if (!internalProxies.length) return proxies
@@ -80,7 +97,7 @@ async function operator(proxies = [], targetPlatform, context) {
         Authorization: httpMetaAuthorization,
       },
       body: JSON.stringify({
-        proxies: internalProxies,
+        proxies: internalProxies.map(({ _stale_google_cache, ...proxy }) => proxy),
         timeout: httpMetaTimeout,
       }),
     })
@@ -128,6 +145,7 @@ async function operator(proxies = [], targetPlatform, context) {
   async function check(proxy, internalIndex) {
     const originalIndex = proxy._proxies_index
     const original = proxies[originalIndex]
+    const staleCache = proxy._stale_google_cache
     const name = original?.name || proxy.name || String(originalIndex)
     const startedAt = Date.now()
 
@@ -156,10 +174,10 @@ async function operator(proxies = [], targetPlatform, context) {
       }
 
       const latency = Date.now() - startedAt
-      original._googleStatus = result.kind
+      applyProbeResult(original, result)
 
-      if (result.body !== undefined) {
-        original._geo = result.body
+      if (cacheTtl > 0 && (result.kind === 'clean' || result.kind === 'cn')) {
+        writeProbeCache(original, url, result)
       }
 
       if (result.kind === 'clean' && result.region) {
@@ -173,9 +191,78 @@ async function operator(proxies = [], targetPlatform, context) {
         `[${name}] status: ${result.statusCode}, verdict: ${result.kind}, latency: ${latency}`
       )
     } catch (e) {
+      if (staleCache?.result && (staleCache.result.kind === 'clean' || staleCache.result.kind === 'cn')) {
+        applyProbeResult(original, staleCache.result)
+        $.error(`[${name}] probe failed; using stale cache: ${e.message ?? e}`)
+        return
+      }
+
       original._googleStatus = 'unknown'
       $.error(`[${name}] ${e.message ?? e}`)
     }
+  }
+}
+
+function probeCacheKey(proxy, url) {
+  const identity = [
+    String(proxy?.type ?? '').trim().toLowerCase(),
+    String(proxy?.name ?? '').trim(),
+    String(proxy?.server ?? '').trim().toLowerCase(),
+    String(proxy?.port ?? '').trim(),
+    String(proxy?.sni ?? proxy?.servername ?? '').trim().toLowerCase(),
+    String(url ?? '').trim(),
+  ].join('|')
+
+  return `#google-region-probe:${encodeURIComponent(identity)}`
+}
+
+function readProbeCache(proxy, url) {
+  if (typeof $substore?.read !== 'function') return null
+
+  try {
+    const raw = $substore.read(probeCacheKey(proxy, url))
+    if (!raw) return null
+
+    const cached = JSON.parse(raw)
+    if (!cached || !Number.isFinite(Number(cached.time)) || !cached.result) {
+      return null
+    }
+
+    return {
+      time: Number(cached.time),
+      result: cached.result,
+    }
+  } catch (_) {
+    return null
+  }
+}
+
+function writeProbeCache(proxy, url, result) {
+  if (typeof $substore?.write !== 'function') return
+
+  try {
+    $substore.write(
+      JSON.stringify({
+        time: Date.now(),
+        result: {
+          kind: result.kind,
+          statusCode: result.statusCode,
+          region: result.region,
+          body: result.body,
+        },
+      }),
+      probeCacheKey(proxy, url)
+    )
+  } catch (_) {}
+}
+
+function applyProbeResult(proxy, result) {
+  proxy._googleStatus = result.kind
+
+  if (result.body !== undefined) {
+    proxy._geo = result.body
+  } else {
+    delete proxy._geo
   }
 }
 
