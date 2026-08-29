@@ -32,7 +32,8 @@ async function operator(proxies = [], targetPlatform, context) {
   const httpMetaProtocol = $arguments.http_meta_protocol ?? 'http'
   const httpMetaAuthorization = $arguments.http_meta_authorization ?? ''
   const httpMetaApi = `${httpMetaProtocol}://${httpMetaHost}:${httpMetaPort}`
-  const startDelay = parseFloat($arguments.http_meta_start_delay ?? 3000)
+  const startDelay = parseFloat($arguments.http_meta_start_delay ?? 1500)
+  const startRetryDelay = parseFloat($arguments.http_meta_start_retry_delay ?? 1500)
   const proxyTimeout = parseFloat($arguments.http_meta_proxy_timeout ?? 10000)
   const requestTimeout = parseFloat($arguments.timeout ?? 10000)
   const concurrency = Math.max(1, parseInt($arguments.concurrency || 10))
@@ -66,7 +67,7 @@ async function operator(proxies = [], targetPlatform, context) {
   $.info(`Google probe 核心支持节点数: ${internalProxies.length}/${proxies.length}`)
   if (!internalProxies.length) return proxies
 
-  const httpMetaTimeout = startDelay + internalProxies.length * proxyTimeout
+  const httpMetaTimeout = startDelay + startRetryDelay + internalProxies.length * proxyTimeout
   let httpMetaPid
   let httpMetaPorts = []
 
@@ -131,12 +132,28 @@ async function operator(proxies = [], targetPlatform, context) {
     const startedAt = Date.now()
 
     try {
-      const result = await probeViaHttpMeta({
-        proxyHost: httpMetaHost,
-        proxyPort: httpMetaPorts[internalIndex],
-        url,
-        timeout: requestTimeout,
-      })
+      let result
+
+      try {
+        result = await probeViaHttpMeta({
+          proxyHost: httpMetaHost,
+          proxyPort: httpMetaPorts[internalIndex],
+          url,
+          timeout: requestTimeout,
+        })
+      } catch (e) {
+        if (!isLocalProxyStartupError(e) || startRetryDelay <= 0) throw e
+
+        $.info(`[${name}] HTTP META proxy not ready, retrying in ${startRetryDelay}ms`)
+        await $.wait(startRetryDelay)
+
+        result = await probeViaHttpMeta({
+          proxyHost: httpMetaHost,
+          proxyPort: httpMetaPorts[internalIndex],
+          url,
+          timeout: requestTimeout,
+        })
+      }
 
       const latency = Date.now() - startedAt
       original._googleStatus = result.kind
@@ -160,6 +177,11 @@ async function operator(proxies = [], targetPlatform, context) {
       $.error(`[${name}] ${e.message ?? e}`)
     }
   }
+}
+
+function isLocalProxyStartupError(error) {
+  const message = String(error?.message ?? error ?? '')
+  return /(?:failed|could not|couldn't) connect to .*127\.0\.0\.1|connection refused/i.test(message)
 }
 
 async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout }) {
