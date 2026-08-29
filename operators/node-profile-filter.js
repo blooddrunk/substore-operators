@@ -342,7 +342,7 @@ function matchString(actual, expected, normalizer = normalizeLower) {
 }
 
 function matchRegex(actual, pattern) {
-  if (expected === undefined || expected === null || expected === '') return true;
+  if (pattern === undefined || pattern === null || pattern === '') return true;
   try {
     return new RegExp(String(pattern), 'i').test(String(actual ?? ''));
   } catch (error) {
