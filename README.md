@@ -4,28 +4,20 @@
 
 Personal [Sub-Store](https://github.com/sub-store-org/Sub-Store) remote operators for proxy subscription processing.
 
-This repository keeps reusable Sub-Store scripts in Git so they can be versioned, reviewed, reused, and loaded directly as remote scripts.
+The repository separates static policy from dynamic probing: classify nodes into user-defined pools first, then let sing-box / daed / Xray urltest or load balancing compete only inside the selected pool.
 
-## Design goal
-
-The repository separates policy from runtime probing:
-
-- protocol, route quality, traffic/cost tier, region, and provider are static or semi-static policy;
-- Google region status is a dynamic probe;
-- sing-box / daed / Xray urltest or load balancing should only compare nodes that already belong to the same policy pool.
-
-This prevents a low-RTT but poor China-route node from defeating a better optimized route purely because its latency is lower.
+This prevents a low-RTT but poor China-route node from defeating a better route purely because latency is lower.
 
 ## Operators
 
 ### `protocol-filter.js`
 
-Filters a 3x-ui subscription to the proxy types used by this setup and, before DNS Resolve replaces `server` with an IP address:
+Filters the original subscription to VLESS / Hysteria2 and, before DNS Resolve replaces `server` with an IP:
 
-1. preserves the original Hysteria2 TLS hostname when no explicit SNI exists;
-2. stores the original hostname in temporary `_originServer` metadata so later policy filters can still identify the node reliably.
+1. preserves the Hysteria2 TLS hostname when needed;
+2. stores the original hostname in temporary `_originServer` metadata for later node classification.
 
-Remote script URL:
+Remote script:
 
 ```text
 https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/protocol-filter.js
@@ -41,58 +33,62 @@ Supported `filterType` values:
 | `hysteria2` | Hysteria2 only |
 | `hy2` | Alias of `hysteria2` |
 
-### `node-profile-filter.js`
+---
 
-Filters nodes into policy pools before urltest / load balancing.
+## `node-profile-filter.js`
 
-Remote script URL:
+This is the route/policy classification operator.
+
+Remote script:
 
 ```text
 https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js
 ```
 
-Supported filters:
+### Mental model
 
-| Parameter | Example | Meaning |
-| --- | --- | --- |
-| `profile` | `main,premium` | Policy pool |
-| `route` | `optimized` | China-route class |
-| `traffic` | `high` | Traffic/cost tier |
-| `region` | `JP,US` | Server region |
-| `provider` | `nosla,bitsflow` | Host/route provider |
-| `asn` | `12345,AS67890` | Server ASN |
-| `host` | `nosla.haoqi90.top` | Original hostname |
-
-Values inside one field use OR; different fields use AND. Example:
+Remember three lines:
 
 ```text
-route=optimized&region=JP,SG
+rules / rulesUrl = define what each node is
+profile / route / traffic / ... = filter using that metadata
+urltest = choose the current winner only among surviving nodes
 ```
 
-means “optimized China route AND located in Japan or Singapore”.
+The operator contains **no built-in node, provider, or route data**.
 
-Default profile derivation:
+### 1. What are `rules`?
+
+`rules` are your node-profile database.
+
+Each rule has two explicit parts:
+
+```json
+{
+  "match": {
+    "host": "node-a.example.com"
+  },
+  "set": {
+    "provider": "provider-a",
+    "route": "optimized",
+    "traffic": "high",
+    "profile": "main"
+  }
+}
+```
+
+Meaning:
 
 ```text
-main     = optimized + high traffic
-premium  = optimized + low traffic
-backup   = standard
-optimized = route=optimized
-standard  = route=standard
+if original hostname == node-a.example.com
+then assign:
+  provider = provider-a
+  route    = optimized
+  traffic  = high
+  profile  = main
 ```
 
-Only explicitly established route facts are built in:
-
-```text
-nosla.haoqi90.top    -> provider=nosla, route=optimized
-bitsflow.haoqi90.top -> provider=bitsflow, route=standard
-```
-
-Unknown route/traffic properties remain unknown; ASN, country, and latency are never used to guess “China optimized”.
-
-#### Custom rules
-
-Pass a JSON array through `rules`. Later rules override earlier rules, and user rules run after built-ins.
+`match` identifies a node. `set` assigns metadata.
 
 Supported match fields:
 
@@ -105,15 +101,107 @@ subName
 subNameRegex
 ```
 
-Supported profile fields:
+`host` is recommended because `protocol-filter.js` preserves the original hostname in `_originServer` before DNS Resolve changes `server` to an IP.
+
+Supported set fields:
 
 ```text
 provider
 route
 traffic
+profile
 region
 asn
-profile
+```
+
+Country, ASN, and latency are never used to infer route quality.
+
+### 2. What is `profile`?
+
+`profile` is simply a **user-defined business/policy label**.
+
+For example:
+
+```text
+main      primary pool
+premium   high-quality but limited/expensive pool
+backup    standard-route fallback pool
+```
+
+Assign it explicitly in your rule:
+
+```json
+"profile": "main"
+```
+
+There is **no automatic derivation**.
+
+Therefore:
+
+```text
+route=optimized
+```
+
+does not automatically imply:
+
+```text
+profile=main
+```
+
+`route`, `traffic`, and `profile` are independent dimensions.
+
+You may also use arbitrary profile names such as:
+
+```text
+home
+work
+streaming
+```
+
+### 3. Why keep `route`, `traffic`, and `profile` separate?
+
+They describe different facts.
+
+Example:
+
+```json
+{
+  "route": "optimized",
+  "traffic": "low",
+  "profile": "premium"
+}
+```
+
+means an optimized China route with limited/expensive traffic assigned to the `premium` pool.
+
+Another node might be:
+
+```json
+{
+  "route": "standard",
+  "traffic": "high",
+  "profile": "backup"
+}
+```
+
+This allows both direct pool selection:
+
+```text
+profile=main
+```
+
+and ad-hoc filtering:
+
+```text
+route=optimized&region=JP
+```
+
+### 4. Recommended way to predefine all nodes: `rulesUrl`
+
+For more than a couple of nodes, keep profile definitions in a separate JSON file such as:
+
+```text
+node-profile-rules.json
 ```
 
 Example:
@@ -121,191 +209,285 @@ Example:
 ```json
 [
   {
-    "host": "nosla.haoqi90.top",
-    "traffic": "low"
+    "match": {
+      "host": "node-a.example.com"
+    },
+    "set": {
+      "provider": "provider-a",
+      "route": "optimized",
+      "traffic": "high",
+      "profile": "main",
+      "region": "JP"
+    }
   },
   {
-    "host": "lightlayer.haoqi90.top",
-    "provider": "lightlayer",
-    "route": "optimized",
-    "traffic": "high"
+    "match": {
+      "host": "node-b.example.com"
+    },
+    "set": {
+      "provider": "provider-b",
+      "route": "optimized",
+      "traffic": "low",
+      "profile": "premium",
+      "region": "JP"
+    }
+  },
+  {
+    "match": {
+      "host": "node-c.example.com"
+    },
+    "set": {
+      "provider": "provider-c",
+      "route": "standard",
+      "traffic": "high",
+      "profile": "backup",
+      "region": "US"
+    }
   }
 ]
 ```
 
-URL-encode the JSON when passing it in a remote-script fragment.
-
-#### MMDB server geography / ASN
-
-Node.js Sub-Store can use local MMDB files:
-
-```yaml
-services:
-  sub-store:
-    environment:
-      SUB_STORE_MMDB_CRON: 0 15 * * *
-      SUB_STORE_MMDB_COUNTRY_URL: https://github.com/xream/geoip/releases/latest/download/ipinfo.country.mmdb
-      SUB_STORE_MMDB_COUNTRY_PATH: /opt/app/data/GeoLite2-Country.mmdb
-      SUB_STORE_MMDB_ASN_URL: https://github.com/xream/geoip/releases/latest/download/ipinfo.asn.mmdb
-      SUB_STORE_MMDB_ASN_PATH: /opt/app/data/GeoLite2-ASN.mmdb
-    volumes:
-      - ./data:/opt/app/data
-```
-
-> A fresh install with no MMDB file does not automatically download one immediately; prepare the file first or wait for the configured cron run.
-
-After DNS Resolve, `node-profile-filter.js` queries the final `proxy.server` IP directly with local MMDB:
+A generic template is included at:
 
 ```text
-server IP -> Country / ASN / AS Organization
+examples/node-profile-rules.example.json
 ```
 
-No HTTP META instance is required for this server-side classification. Paths can also be overridden with:
+Host your own JSON at an HTTP(S) URL that Sub-Store can reach, then use:
 
 ```text
-mmdb_country_path=/path/to/country.mmdb
-mmdb_asn_path=/path/to/asn.mmdb
+node-profile-filter.js#rulesUrl=<URL-encoded-JSON-URL>&profile=main
 ```
 
-Country/ASN are objective metadata only. They are not treated as proof of an optimized China route.
+Conceptually:
 
-For diagnostics, enable:
+```text
+rulesUrl=https://example.com/node-profile-rules.json
+profile=main
+```
+
+The operator loads the JSON, classifies the nodes, then keeps only `profile=main`.
+
+If `rulesUrl` cannot be fetched, the operator fails instead of silently running with empty rules.
+
+### 5. Inline `rules`
+
+For quick tests or one/two nodes, pass rules directly:
+
+```json
+[
+  {
+    "match": {
+      "host": "node-a.example.com"
+    },
+    "set": {
+      "route": "optimized",
+      "profile": "main"
+    }
+  }
+]
+```
+
+URL-encode the JSON and pass it as:
+
+```text
+rules=<encoded JSON>
+```
+
+`rulesUrl` and `rules` can be combined. Remote rules are applied first and inline rules last, so inline rules can override remote configuration.
+
+Legacy flat rules remain accepted for compatibility:
+
+```json
+{
+  "host": "node-a.example.com",
+  "route": "optimized"
+}
+```
+
+but the explicit `match` / `set` form is recommended.
+
+### 6. Filters
+
+| Parameter | Example | Meaning |
+| --- | --- | --- |
+| `profile` | `main,premium` | User-defined policy pool |
+| `route` | `optimized` | Route class |
+| `traffic` | `high` | Traffic/cost tier |
+| `region` | `JP,US` | Server region |
+| `provider` | `provider-a` | Provider |
+| `asn` | `12345,AS67890` | ASN |
+| `host` | `node-a.example.com` | Original hostname |
+
+Values within one field use OR:
+
+```text
+profile=main,premium
+```
+
+means `main OR premium`.
+
+Different fields use AND:
+
+```text
+route=optimized&region=JP,SG
+```
+
+means:
+
+```text
+route=optimized
+AND
+(region=JP OR region=SG)
+```
+
+### 7. Common examples
+
+Primary pool:
+
+```text
+.../node-profile-filter.js#rulesUrl=<encoded-url>&profile=main
+```
+
+Premium pool:
+
+```text
+.../node-profile-filter.js#rulesUrl=<encoded-url>&profile=premium
+```
+
+Backup pool:
+
+```text
+.../node-profile-filter.js#rulesUrl=<encoded-url>&profile=backup
+```
+
+All optimized routes regardless of profile:
+
+```text
+.../node-profile-filter.js#rulesUrl=<encoded-url>&route=optimized
+```
+
+Optimized Japan nodes:
+
+```text
+.../node-profile-filter.js#rulesUrl=<encoded-url>&route=optimized&region=JP
+```
+
+### 8. MMDB is optional
+
+If your rules already define `region`, and you do not need automatic ASN lookup, no MMDB configuration is required.
+
+If configured via:
+
+```text
+SUB_STORE_MMDB_COUNTRY_PATH
+SUB_STORE_MMDB_ASN_PATH
+```
+
+or script parameters, MMDB can enrich the DNS-resolved server IP with:
+
+```text
+region
+asn
+aso
+```
+
+Rule-supplied `region/asn` values take precedence. Country/ASN are never used to infer `route`.
+
+### 9. Diagnostics
+
+Enable:
 
 ```text
 metadata=true
 ```
 
-which temporarily attaches `_nodeProfile`. The final Google filter also removes `_nodeProfile` and `_originServer` defensively.
+to temporarily keep:
+
+```text
+_nodeProfile.host
+_nodeProfile.provider
+_nodeProfile.route
+_nodeProfile.traffic
+_nodeProfile.profile
+_nodeProfile.region
+_nodeProfile.asn
+_nodeProfile.aso
+```
+
+The final Google filter removes `_nodeProfile` and `_originServer` defensively.
+
+---
 
 ### `http-meta-geo.js`
 
-Forked from xream's `http_meta_geo.js`. It preserves upstream behavior and removes Hysteria2 `ports` only from the temporary probe copy so HTTP META uses the primary `port`; the original node and final subscription keep port hopping intact.
+Forked from xream's `http_meta_geo.js`. Hysteria2 `ports` is removed only from the temporary HTTP META probe copy so the primary `port` is used for probing; the final subscription keeps port hopping intact.
 
-It is appropriate when you need the real proxy egress Country/ASN. By contrast, `node-profile-filter.js` MMDB classification describes the DNS-resolved server IP itself.
+Use this when you need real proxy-egress Country/ASN. `node-profile-filter.js` MMDB enrichment instead describes the DNS-resolved server IP itself.
 
 ### `google-region-probe.js`
 
-The recommended Google-region probe. It creates a local HTTP META / Mihomo proxy per node and uses container `curl` to request YouTube Premium.
-
-Results are classified as:
+Google-region probe using HTTP META / Mihomo and YouTube Premium. Results are:
 
 ```text
 clean | cn | unknown
 ```
 
-and stored in `_googleStatus` for the next operator.
+and stored in `_googleStatus`.
 
 ### `google-region-check.js`
 
-Filters `_googleStatus` and keeps compatibility with the historical `_geo` + `www.google.cn` marker.
+Filters `_googleStatus`:
 
-Supported values:
-
-| Value | Result |
+| `googleStatus` | Result |
 | --- | --- |
-| `all` | Keep all nodes |
-| `clean` | Keep only confirmed clean nodes |
-| `ok` | Alias of `clean` |
+| `all` | Keep all |
+| `clean` / `ok` | Confirmed clean only |
 | `non-cn` | Keep `clean + unknown` |
-| `cn` | Keep only confirmed CN nodes |
-| `china` | Alias of `cn` |
-| `unknown` | Keep only indeterminate nodes |
+| `cn` / `china` | Confirmed CN only |
+| `unknown` | Indeterminate only |
 
 It removes `_geo`, `_googleStatus`, `_originServer`, and `_nodeProfile` before final output.
 
 ## Recommended pipeline
 
 ```text
-3x-ui original subscription
+original subscription
         │
         ▼
-┌──────────────────────────────┐
-│ 1 protocol-filter.js         │
-│                              │
-│ protocol filtering           │
-│ preserve HY2 SNI             │
-│ preserve _originServer       │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 2 DNS Resolve Action         │
-│                              │
-│ hostname -> IPv4             │
-│ TLS validation enabled       │
-│ cache 300-600 s              │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 3 node-profile-filter.js     │
-│                              │
-│ static: route / traffic      │
-│         provider / profile   │
-│ MMDB: region / ASN           │
-│                              │
-│ shrink the candidate pool    │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 4 google-region-probe.js     │
-│                              │
-│ probe surviving nodes only   │
-│ clean / cn / unknown         │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 5 google-region-check.js     │
-│                              │
-│ Google status filter         │
-│ clean temporary metadata     │
-└──────────────┬───────────────┘
-               │
-               ▼
-      sing-box / daed / Xray
-               │
-               ▼
-       urltest / load balance
-       within the same tier
+protocol-filter.js
+  protocol filter + preserve SNI / _originServer
+        │
+        ▼
+DNS Resolve
+  hostname -> IP
+        │
+        ▼
+node-profile-filter.js
+  rules/rulesUrl define metadata
+  profile/route/... select a candidate pool
+        │
+        ▼
+google-region-probe.js
+  probe surviving nodes only
+        │
+        ▼
+google-region-check.js
+  Google filter + metadata cleanup
+        │
+        ▼
+sing-box / daed / Xray
+        │
+        ▼
+urltest / load balance
+inside the selected pool only
 ```
 
-Putting node-profile filtering before HTTP META also avoids probing nodes that cannot enter the requested policy pool anyway.
-
-## Copy-ready examples
-
-Optimized routes only:
+Core principle:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#profile=optimized
-```
-
-Standard/backup routes:
-
-```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#profile=backup
-```
-
-Optimized Japan nodes:
-
-```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#route=optimized&region=JP
-```
-
-Specific provider:
-
-```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#provider=nosla
-```
-
-Use `profile=main` / `profile=premium` after the relevant hosts have an explicit `traffic` tier.
-
-The core rule is:
-
-```text
-Profile chooses the candidate pool.
-URLTest chooses the current winner inside that pool.
+You decide which pool a node belongs to.
+URLTest only decides which node wins inside that pool now.
 ```
 
 ## Repository layout
@@ -314,6 +496,8 @@ URLTest chooses the current winner inside that pool.
 .
 ├── README.md
 ├── README.zh-CN.md
+├── examples/
+│   └── node-profile-rules.example.json
 └── operators/
     ├── protocol-filter.js
     ├── node-profile-filter.js
@@ -324,9 +508,10 @@ URLTest chooses the current winner inside that pool.
 
 ## Maintenance principles
 
+- Operator source contains no personal node, provider, or route built-ins.
 - Do not infer China-route quality from RTT.
 - Do not infer “optimized” from Country/ASN.
+- `profile` is explicit user-defined policy metadata, not derived from `route/traffic`.
 - Leave unknown route attributes unknown.
-- User rules override built-ins.
-- Dynamic network probes keep an explicit `unknown` state.
-- Remove temporary metadata before final subscription output.
+- Keep an explicit `unknown` state for dynamic probes.
+- Remove temporary metadata before final output.
