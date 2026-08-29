@@ -1,0 +1,37 @@
+[
+  {
+    "match": {
+      "host": "main-jp.example.com"
+    },
+    "set": {
+      "provider": "provider-a",
+      "route": "optimized",
+      "traffic": "high",
+      "profile": "main",
+      "region": "JP"
+    }
+  },
+  {
+    "match": {
+      "host": "premium-jp.example.com"
+    },
+    "set": {
+      "provider": "provider-b",
+      "route": "optimized",
+      "traffic": "low",
+      "profile": "premium",
+      "region": "JP"
+    }
+  },
+  {
+    "match": {
+      "hostRegex": "^backup-.*\\.example\\.com$"
+    },
+    "set": {
+      "provider": "provider-c",
+      "route": "standard",
+      "traffic": "high",
+      "profile": "backup"
+    }
+  }
+]
