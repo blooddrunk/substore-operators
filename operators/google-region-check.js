@@ -1,15 +1,17 @@
 /**
- * Classify and filter Google region probe results produced by http-meta-geo.js.
+ * Classify and filter Google region probe results.
  *
- * Expected upstream probe:
- *   api=https://www.youtube.com/premium
- *   geo=true
- *   format={{proxy.name}}
+ * Preferred upstream contract:
+ *   _googleStatus = clean | cn | unknown
+ *
+ * Compatibility fallback:
+ *   if `_googleStatus` is absent, inspect `_geo` and use the historical
+ *   www.google.cn marker produced by http-meta-geo.js.
  *
  * googleStatus:
  *   all      - keep all nodes (default)
- *   clean    - keep nodes whose probe succeeded and does not contain www.google.cn
- *   cn       - keep nodes whose probe contains www.google.cn
+ *   clean    - keep nodes classified clean
+ *   cn       - keep nodes classified cn
  *   unknown  - keep nodes without a reliable probe result
  *
  * Aliases:
@@ -76,6 +78,14 @@ function stringifyGeo(value) {
 }
 
 function classifyGoogleStatus(proxy) {
+  const explicit = String(proxy?._googleStatus ?? '')
+    .trim()
+    .toLowerCase();
+
+  if (explicit === 'clean' || explicit === 'cn' || explicit === 'unknown') {
+    return explicit;
+  }
+
   if (!proxy || !Object.prototype.hasOwnProperty.call(proxy, '_geo')) {
     return 'unknown';
   }
@@ -111,8 +121,6 @@ function operator(proxies = []) {
       return [];
     }
 
-    // _geo may contain the complete YouTube Premium HTML response.
-    // It is probe-only metadata and should not leak into the final subscription.
     const result = { ...proxy };
     delete result._geo;
     delete result._googleStatus;
