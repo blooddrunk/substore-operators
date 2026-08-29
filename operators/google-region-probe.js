@@ -15,6 +15,9 @@
  * one Google egress identity. This is useful when Reality/Hysteria2 inbounds on
  * the same VPS share the same outbound path. Leave it disabled if different
  * inbounds on one server can use different egress routes.
+ *
+ * `probe_budget` is a total per-probe time budget across redirects and the
+ * optional HTTP META startup retry. Default: 8000ms.
  */
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -33,9 +36,12 @@ async function operator(proxies = [], targetPlatform, context) {
   const startRetryDelay = parseFloat($arguments.http_meta_start_retry_delay ?? 1500)
   const proxyTimeout = parseFloat($arguments.http_meta_proxy_timeout ?? 10000)
   const requestTimeout = parseFloat($arguments.timeout ?? 10000)
+  const probeBudget = Math.max(1000, parseFloat($arguments.probe_budget ?? 8000))
   const concurrency = Math.max(1, parseInt($arguments.concurrency || 10))
   const cacheTtl = Math.max(0, parseFloat($arguments.cache_ttl ?? 900000))
-  const shareByServer = /^(1|true|yes|on)$/i.test(String($arguments.share_by_server ?? 'false'))
+  const shareByServer = /^(1|true|yes|on)$/i.test(
+    String($arguments.share_by_server ?? 'false')
+  )
   const includeUnsupportedProxy = $arguments.include_unsupported_proxy
   const url = $arguments.api || 'https://www.youtube.com/premium'
 
@@ -120,7 +126,12 @@ async function operator(proxies = [], targetPlatform, context) {
   $.info(`Google probe 核心支持组数: ${internalProxies.length}/${groups.size}`)
   if (!internalProxies.length) return proxies
 
-  const httpMetaTimeout = startDelay + startRetryDelay + internalProxies.length * proxyTimeout
+  const batches = Math.ceil(internalProxies.length / concurrency)
+  const httpMetaTimeout =
+    startDelay +
+    startRetryDelay +
+    batches * Math.max(proxyTimeout, probeBudget) +
+    2000
   let httpMetaPid
   let httpMetaPorts = []
 
@@ -188,6 +199,7 @@ async function operator(proxies = [], targetPlatform, context) {
     const name = representative?.name || proxy.name || String(representativeIndex)
     const sharedSuffix = indexes.length > 1 ? ` (+${indexes.length - 1} same-server node)` : ''
     const startedAt = Date.now()
+    const deadline = startedAt + probeBudget
 
     try {
       let result
@@ -198,9 +210,15 @@ async function operator(proxies = [], targetPlatform, context) {
           proxyPort: httpMetaPorts[internalIndex],
           url,
           timeout: requestTimeout,
+          deadline,
         })
       } catch (e) {
         if (!isLocalProxyStartupError(e) || startRetryDelay <= 0) throw e
+
+        const remaining = deadline - Date.now()
+        if (remaining <= startRetryDelay + 50) {
+          throw new Error(`Google probe exceeded ${probeBudget}ms total budget`)
+        }
 
         $.info(`[${name}] HTTP META proxy not ready, retrying in ${startRetryDelay}ms`)
         await $.wait(startRetryDelay)
@@ -210,6 +228,7 @@ async function operator(proxies = [], targetPlatform, context) {
           proxyPort: httpMetaPorts[internalIndex],
           url,
           timeout: requestTimeout,
+          deadline,
         })
       }
 
@@ -328,15 +347,20 @@ function isLocalProxyStartupError(error) {
   return /(?:failed|could not|couldn't) connect to .*127\.0\.0\.1|connection refused/i.test(message)
 }
 
-async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout }) {
+async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout, deadline }) {
   let currentUrl = url
 
   for (let i = 0; i < 4; i++) {
+    const remaining = deadline - Date.now()
+    if (remaining < 50) {
+      throw new Error('Google probe exceeded total time budget')
+    }
+
     const response = await curlOnce({
       proxyHost,
       proxyPort,
       url: currentUrl,
-      timeout,
+      timeout: Math.min(timeout, remaining),
     })
 
     const { statusCode, redirectUrl, body } = response
@@ -395,7 +419,7 @@ async function probeViaHttpMeta({ proxyHost, proxyPort, url, timeout }) {
 function curlOnce({ proxyHost, proxyPort, url, timeout }) {
   const { execFile } = eval('require("child_process")')
   const marker = '\n__SUBSTORE_GOOGLE_PROBE_META__'
-  const timeoutSeconds = Math.max(1, Math.ceil(timeout / 1000))
+  const timeoutSeconds = Math.max(0.05, timeout / 1000).toFixed(3)
   const proxyUrl = `http://${proxyHost}:${proxyPort}`
 
   const args = [
@@ -405,9 +429,9 @@ function curlOnce({ proxyHost, proxyPort, url, timeout }) {
     '--proxy',
     proxyUrl,
     '--connect-timeout',
-    String(timeoutSeconds),
+    timeoutSeconds,
     '--max-time',
-    String(timeoutSeconds),
+    timeoutSeconds,
     '--user-agent',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
     '--header',
@@ -425,7 +449,7 @@ function curlOnce({ proxyHost, proxyPort, url, timeout }) {
       args,
       {
         encoding: 'utf8',
-        timeout: timeout + 2000,
+        timeout: Math.ceil(timeout + 500),
         maxBuffer: 16 * 1024 * 1024,
       },
       (error, stdout = '', stderr = '') => {
