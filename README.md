@@ -1,5 +1,7 @@
 # substore-operators
 
+**English** | [简体中文](./README.zh-CN.md)
+
 Personal [Sub-Store](https://github.com/sub-store-org/Sub-Store) remote operators for proxy subscription processing.
 
 This repository keeps reusable Sub-Store scripts in Git so they can be versioned, reviewed, reused, and loaded directly as remote scripts.
@@ -101,6 +103,7 @@ A future implementation can optionally add a prefix/suffix to node names or expo
 ```text
 .
 ├── README.md
+├── README.zh-CN.md
 └── operators/
     └── protocol-filter.js
 ```
