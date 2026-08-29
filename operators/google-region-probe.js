@@ -1,5 +1,5 @@
 /**
- * Probe Google/YouTube region behavior through every proxy using HTTP META.
+ * Probe Google/YouTube region behavior through proxies using HTTP META.
  *
  * Specialized for the Google "送中" check:
  * - 2xx body containing www.google.cn => cn.
@@ -8,15 +8,13 @@
  * - Redirect to google.cn, or consent with gl=CN => cn.
  * - Other failures / redirects => unknown.
  *
- * The probe writes `_googleStatus` explicitly for google-region-check.js and
- * keeps `_geo` only when a response body is available, for compatibility and
- * debugging.
- *
- * Hysteria2 `ports` is removed only from the temporary HTTP META probe copy.
- * The original subscription node remains unchanged.
- *
  * Successful `clean` / `cn` results are cached in Sub-Store storage. Fresh
  * cache entries skip HTTP META entirely. `unknown` is never cached.
+ *
+ * Optional `share_by_server=true` treats nodes on the same resolved server as
+ * one Google egress identity. This is useful when Reality/Hysteria2 inbounds on
+ * the same VPS share the same outbound path. Leave it disabled if different
+ * inbounds on one server can use different egress routes.
  */
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -37,51 +35,89 @@ async function operator(proxies = [], targetPlatform, context) {
   const requestTimeout = parseFloat($arguments.timeout ?? 10000)
   const concurrency = Math.max(1, parseInt($arguments.concurrency || 10))
   const cacheTtl = Math.max(0, parseFloat($arguments.cache_ttl ?? 900000))
+  const shareByServer = /^(1|true|yes|on)$/i.test(String($arguments.share_by_server ?? 'false'))
   const includeUnsupportedProxy = $arguments.include_unsupported_proxy
   const url = $arguments.api || 'https://www.youtube.com/premium'
+
+  const groups = new Map()
+
+  proxies.forEach((proxy, index) => {
+    const key = probeCacheKey(proxy, url, shareByServer)
+    const existing = groups.get(key)
+
+    if (existing) {
+      existing.indexes.push(index)
+      return
+    }
+
+    groups.set(key, {
+      indexes: [index],
+      cached: readProbeCache(proxy, url, shareByServer),
+    })
+  })
+
+  if (shareByServer && groups.size < proxies.length) {
+    $.info(`Google probe shared by server: ${groups.size} groups / ${proxies.length} nodes`)
+  }
 
   const internalProxies = []
   let cacheHits = 0
 
-  proxies.forEach((proxy, index) => {
-    const cached = readProbeCache(proxy, url)
+  for (const group of groups.values()) {
+    const { indexes, cached } = group
 
     if (cached && cacheTtl > 0 && Date.now() - cached.time <= cacheTtl) {
-      applyProbeResult(proxy, cached.result)
-      cacheHits++
-      return
+      for (const index of indexes) {
+        applyProbeResult(proxies[index], cached.result)
+      }
+      cacheHits += indexes.length
+      continue
     }
 
-    try {
-      const probeProxy = { ...proxy }
+    let internalNode
+    let representativeIndex
 
-      // Probe through the primary Hysteria2 port only. The original node keeps
-      // its port-hopping `ports` value for normal subscription use.
-      if (String(probeProxy.type || '').trim().toLowerCase() === 'hysteria2') {
-        delete probeProxy.ports
+    for (const index of indexes) {
+      const proxy = proxies[index]
+
+      try {
+        const probeProxy = { ...proxy }
+
+        // Probe through the primary Hysteria2 port only. The original node keeps
+        // its port-hopping `ports` value for normal subscription use.
+        if (String(probeProxy.type || '').trim().toLowerCase() === 'hysteria2') {
+          delete probeProxy.ports
+        }
+
+        const node = ProxyUtils.produce([probeProxy], 'ClashMeta', 'internal', {
+          'include-unsupported-proxy': includeUnsupportedProxy,
+        })?.[0]
+
+        if (node) {
+          internalNode = node
+          representativeIndex = index
+          break
+        }
+      } catch (e) {
+        $.error(`[${proxy?.name || index}] ${e.message ?? e}`)
       }
-
-      const node = ProxyUtils.produce([probeProxy], 'ClashMeta', 'internal', {
-        'include-unsupported-proxy': includeUnsupportedProxy,
-      })?.[0]
-
-      if (node) {
-        internalProxies.push({
-          ...node,
-          _proxies_index: index,
-          _stale_google_cache: cached,
-        })
-      }
-    } catch (e) {
-      $.error(`[${proxy?.name || index}] ${e.message ?? e}`)
     }
-  })
+
+    if (internalNode) {
+      internalProxies.push({
+        ...internalNode,
+        _proxies_indexes: indexes,
+        _representative_index: representativeIndex,
+        _stale_google_cache: cached,
+      })
+    }
+  }
 
   if (cacheHits) {
     $.info(`Google probe cache hit: ${cacheHits}/${proxies.length}`)
   }
 
-  $.info(`Google probe 核心支持节点数: ${internalProxies.length}/${proxies.length}`)
+  $.info(`Google probe 核心支持组数: ${internalProxies.length}/${groups.size}`)
   if (!internalProxies.length) return proxies
 
   const httpMetaTimeout = startDelay + startRetryDelay + internalProxies.length * proxyTimeout
@@ -97,7 +133,9 @@ async function operator(proxies = [], targetPlatform, context) {
         Authorization: httpMetaAuthorization,
       },
       body: JSON.stringify({
-        proxies: internalProxies.map(({ _stale_google_cache, ...proxy }) => proxy),
+        proxies: internalProxies.map(
+          ({ _proxies_indexes, _representative_index, _stale_google_cache, ...proxy }) => proxy
+        ),
         timeout: httpMetaTimeout,
       }),
     })
@@ -143,10 +181,12 @@ async function operator(proxies = [], targetPlatform, context) {
   return proxies
 
   async function check(proxy, internalIndex) {
-    const originalIndex = proxy._proxies_index
-    const original = proxies[originalIndex]
+    const indexes = proxy._proxies_indexes
+    const representativeIndex = proxy._representative_index
+    const representative = proxies[representativeIndex]
     const staleCache = proxy._stale_google_cache
-    const name = original?.name || proxy.name || String(originalIndex)
+    const name = representative?.name || proxy.name || String(representativeIndex)
+    const sharedSuffix = indexes.length > 1 ? ` (+${indexes.length - 1} same-server node)` : ''
     const startedAt = Date.now()
 
     try {
@@ -174,53 +214,70 @@ async function operator(proxies = [], targetPlatform, context) {
       }
 
       const latency = Date.now() - startedAt
-      applyProbeResult(original, result)
+
+      for (const index of indexes) {
+        applyProbeResult(proxies[index], result)
+      }
 
       if (cacheTtl > 0 && (result.kind === 'clean' || result.kind === 'cn')) {
-        writeProbeCache(original, url, result)
+        writeProbeCache(representative, url, result, shareByServer)
       }
 
       if (result.kind === 'clean' && result.region) {
         $.info(
-          `[${name}] status: ${result.statusCode}, verdict: clean, consent-region: ${result.region}, latency: ${latency}`
+          `[${name}] status: ${result.statusCode}, verdict: clean, consent-region: ${result.region}, latency: ${latency}${sharedSuffix}`
         )
         return
       }
 
       $.info(
-        `[${name}] status: ${result.statusCode}, verdict: ${result.kind}, latency: ${latency}`
+        `[${name}] status: ${result.statusCode}, verdict: ${result.kind}, latency: ${latency}${sharedSuffix}`
       )
     } catch (e) {
-      if (staleCache?.result && (staleCache.result.kind === 'clean' || staleCache.result.kind === 'cn')) {
-        applyProbeResult(original, staleCache.result)
+      if (
+        staleCache?.result &&
+        (staleCache.result.kind === 'clean' || staleCache.result.kind === 'cn')
+      ) {
+        for (const index of indexes) {
+          applyProbeResult(proxies[index], staleCache.result)
+        }
         $.error(`[${name}] probe failed; using stale cache: ${e.message ?? e}`)
         return
       }
 
-      original._googleStatus = 'unknown'
+      for (const index of indexes) {
+        proxies[index]._googleStatus = 'unknown'
+      }
       $.error(`[${name}] ${e.message ?? e}`)
     }
   }
 }
 
-function probeCacheKey(proxy, url) {
-  const identity = [
-    String(proxy?.type ?? '').trim().toLowerCase(),
-    String(proxy?.name ?? '').trim(),
-    String(proxy?.server ?? '').trim().toLowerCase(),
-    String(proxy?.port ?? '').trim(),
-    String(proxy?.sni ?? proxy?.servername ?? '').trim().toLowerCase(),
-    String(url ?? '').trim(),
-  ].join('|')
+function probeCacheKey(proxy, url, shareByServer = false) {
+  const identity = shareByServer
+    ? [
+        'server',
+        String(proxy?.server ?? '').trim().toLowerCase(),
+        String(url ?? '').trim(),
+      ]
+    : [
+        'node',
+        String(proxy?.type ?? '').trim().toLowerCase(),
+        String(proxy?.name ?? '').trim(),
+        String(proxy?.server ?? '').trim().toLowerCase(),
+        String(proxy?.port ?? '').trim(),
+        String(proxy?.sni ?? proxy?.servername ?? '').trim().toLowerCase(),
+        String(url ?? '').trim(),
+      ]
 
-  return `#google-region-probe:${encodeURIComponent(identity)}`
+  return `#google-region-probe:${encodeURIComponent(identity.join('|'))}`
 }
 
-function readProbeCache(proxy, url) {
+function readProbeCache(proxy, url, shareByServer = false) {
   if (typeof $substore?.read !== 'function') return null
 
   try {
-    const raw = $substore.read(probeCacheKey(proxy, url))
+    const raw = $substore.read(probeCacheKey(proxy, url, shareByServer))
     if (!raw) return null
 
     const cached = JSON.parse(raw)
@@ -237,7 +294,7 @@ function readProbeCache(proxy, url) {
   }
 }
 
-function writeProbeCache(proxy, url, result) {
+function writeProbeCache(proxy, url, result, shareByServer = false) {
   if (typeof $substore?.write !== 'function') return
 
   try {
@@ -251,7 +308,7 @@ function writeProbeCache(proxy, url, result) {
           body: result.body,
         },
       }),
-      probeCacheKey(proxy, url)
+      probeCacheKey(proxy, url, shareByServer)
     )
   } catch (_) {}
 }
