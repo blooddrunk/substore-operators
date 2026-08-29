@@ -521,6 +521,8 @@ clean | cn | unknown
 
 写入 `_googleStatus`。
 
+探测结果会缓存到 Sub-Store 存储，命中缓存的后续生产会完全跳过 HTTP META：`clean` / `cn` 缓存 `cache_ttl`（默认 15 分钟），`unknown` 缓存 `unknown_cache_ttl`（默认 10 分钟，设 `0` 恢复不缓存）。缓存 `unknown` 可以避免死节点/慢节点在每次生产时都付出完整探测超时——对 daed 这类订阅更新超时硬编码为 5 秒的客户端尤其重要。探测抛出异常时，会回退使用最近一次任意类型的缓存结果。
+
 ### `google-region-check.js`
 
 根据 `_googleStatus` 过滤：

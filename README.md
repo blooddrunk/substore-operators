@@ -435,6 +435,8 @@ clean | cn | unknown
 
 and stored in `_googleStatus`.
 
+Verdicts are cached in Sub-Store storage so repeated productions skip HTTP META entirely: `clean` / `cn` for `cache_ttl` (default 15 min), `unknown` for `unknown_cache_ttl` (default 10 min, `0` disables). Caching `unknown` keeps dead or slow nodes from paying a full probe timeout on every production — important for clients with tight timeouts such as daed's hard-coded 5s subscription update budget. When a probe attempt throws, the most recent cached verdict of any kind is reused as a stale fallback.
+
 ### `google-region-check.js`
 
 Filters `_googleStatus`:

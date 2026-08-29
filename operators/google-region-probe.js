@@ -8,8 +8,13 @@
  * - Redirect to google.cn, or consent with gl=CN => cn.
  * - Other failures / redirects => unknown.
  *
- * Successful `clean` / `cn` results are cached in Sub-Store storage. Fresh
- * cache entries skip HTTP META entirely. `unknown` is never cached.
+ * Verdicts are cached in Sub-Store storage so fresh productions skip HTTP META
+ * entirely: `clean` / `cn` for `cache_ttl` (default 15 min), `unknown` for
+ * `unknown_cache_ttl` (default 10 min). Caching `unknown` keeps dead or slow
+ * nodes from paying a full probe timeout on every production; set
+ * `unknown_cache_ttl=0` to restore the old never-cache-unknown behavior.
+ * When a probe attempt throws, the most recent cached verdict of any kind is
+ * reused as a stale fallback.
  *
  * Optional `share_by_server=true` treats nodes on the same resolved server as
  * one Google egress identity. This is useful when Reality/Hysteria2 inbounds on
@@ -39,6 +44,7 @@ async function operator(proxies = [], targetPlatform, context) {
   const probeBudget = Math.max(1000, parseFloat($arguments.probe_budget ?? 8000))
   const concurrency = Math.max(1, parseInt($arguments.concurrency || 10))
   const cacheTtl = Math.max(0, parseFloat($arguments.cache_ttl ?? 900000))
+  const unknownCacheTtl = Math.max(0, parseFloat($arguments.unknown_cache_ttl ?? 600000))
   const shareByServer = /^(1|true|yes|on)$/i.test(
     String($arguments.share_by_server ?? 'false')
   )
@@ -69,15 +75,20 @@ async function operator(proxies = [], targetPlatform, context) {
   const internalProxies = []
   let cacheHits = 0
 
+  const cacheTtlFor = (kind) => (kind === 'unknown' ? unknownCacheTtl : cacheTtl)
+
   for (const group of groups.values()) {
     const { indexes, cached } = group
 
-    if (cached && cacheTtl > 0 && Date.now() - cached.time <= cacheTtl) {
-      for (const index of indexes) {
-        applyProbeResult(proxies[index], cached.result)
+    if (cached) {
+      const ttl = cacheTtlFor(cached.result.kind)
+      if (ttl > 0 && Date.now() - cached.time <= ttl) {
+        for (const index of indexes) {
+          applyProbeResult(proxies[index], cached.result)
+        }
+        cacheHits += indexes.length
+        continue
       }
-      cacheHits += indexes.length
-      continue
     }
 
     let internalNode
@@ -238,7 +249,9 @@ async function operator(proxies = [], targetPlatform, context) {
         applyProbeResult(proxies[index], result)
       }
 
-      if (cacheTtl > 0 && (result.kind === 'clean' || result.kind === 'cn')) {
+      if (result.kind === 'clean' || result.kind === 'cn') {
+        if (cacheTtl > 0) writeProbeCache(representative, url, result, shareByServer)
+      } else if (result.kind === 'unknown' && unknownCacheTtl > 0) {
         writeProbeCache(representative, url, result, shareByServer)
       }
 
@@ -253,10 +266,7 @@ async function operator(proxies = [], targetPlatform, context) {
         `[${name}] status: ${result.statusCode}, verdict: ${result.kind}, latency: ${latency}${sharedSuffix}`
       )
     } catch (e) {
-      if (
-        staleCache?.result &&
-        (staleCache.result.kind === 'clean' || staleCache.result.kind === 'cn')
-      ) {
+      if (staleCache?.result) {
         for (const index of indexes) {
           applyProbeResult(proxies[index], staleCache.result)
         }
@@ -267,6 +277,11 @@ async function operator(proxies = [], targetPlatform, context) {
       for (const index of indexes) {
         proxies[index]._googleStatus = 'unknown'
       }
+
+      if (unknownCacheTtl > 0) {
+        writeProbeCache(representative, url, { kind: 'unknown', statusCode: 0 }, shareByServer)
+      }
+
       $.error(`[${name}] ${e.message ?? e}`)
     }
   }
