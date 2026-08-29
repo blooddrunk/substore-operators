@@ -1,19 +1,20 @@
 /**
  * Classify and filter nodes before runtime urltest/load-balancing.
  *
- * The script intentionally contains NO built-in node/provider/route data.
+ * The script contains no built-in node/provider/route data.
  * Node metadata comes from user rules, an optional rulesUrl, and optional MMDB.
  *
  * Mental model:
  *   1. rules / rulesUrl define node metadata.
- *   2. profile / route / traffic / region / provider / asn / host filter it.
+ *   2. profile / route / traffic / region / city / provider / asn / host filter it.
  *   3. urltest/load-balancing only compares the surviving nodes.
  *
  * Filters (comma-separated values are OR; different fields are AND):
  *   profile=main,premium
  *   route=optimized,standard
- *   traffic=high,low
+ *   traffic=high,medium,low
  *   region=JP,US
+ *   city=TYO,SJC
  *   provider=provider-a,provider-b
  *   asn=12345,AS67890
  *   host=node.example.com
@@ -31,6 +32,7 @@
  *       "traffic": "high",
  *       "profile": "main",
  *       "region": "JP",
+ *       "city": "TYO",
  *       "asn": "12345"
  *     }
  *   }
@@ -39,13 +41,10 @@
  *   host, hostRegex, name, nameRegex, subName, subNameRegex
  *
  * Set fields:
- *   provider, route, traffic, region, asn, profile
+ *   provider, route, traffic, region, city, asn, profile
  *
  * Later matching rules override earlier rules. rulesUrl rules are applied first;
  * inline rules are applied last, so inline rules can override remote config.
- *
- * Legacy flat rules are still accepted for backward compatibility:
- *   { "host": "node.example.com", "route": "optimized" }
  *
  * Optional MMDB enrichment:
  *   mmdb_country_path=<path>
@@ -56,28 +55,13 @@
  *
  * MMDB only fills region/asn/aso when those values are not already supplied by
  * rules. Country/ASN/latency are NEVER used to infer route quality.
- *
- * Diagnostics:
- *   metadata=true   keep `_nodeProfile` temporarily
- *
- * Parameter priority:
- *   $options > $arguments > defaults
  */
 
 const scriptArgs =
-  typeof $arguments === 'object' && $arguments
-    ? $arguments
-    : {};
-
+  typeof $arguments === 'object' && $arguments ? $arguments : {};
 const requestOptions =
-  typeof $options === 'object' && $options
-    ? $options
-    : {};
-
-const options = {
-  ...scriptArgs,
-  ...requestOptions,
-};
+  typeof $options === 'object' && $options ? $options : {};
+const options = { ...scriptArgs, ...requestOptions };
 
 const MATCH_FIELDS = Object.freeze([
   'host',
@@ -93,6 +77,7 @@ const SET_FIELDS = Object.freeze([
   'route',
   'traffic',
   'region',
+  'city',
   'asn',
   'profile',
 ]);
@@ -105,7 +90,6 @@ function toBoolean(value, fallback = false) {
 
 function list(value) {
   if (value === undefined || value === null || value === '') return [];
-
   return String(value)
     .split(',')
     .map((item) => item.trim())
@@ -184,7 +168,6 @@ function normalizeRule(rule, index, source) {
     throw new TypeError(`${source}[${index}] must be an object`);
   }
 
-  // Canonical explicit schema.
   if (
     Object.prototype.hasOwnProperty.call(rule, 'match') ||
     Object.prototype.hasOwnProperty.call(rule, 'set')
@@ -195,7 +178,6 @@ function normalizeRule(rule, index, source) {
     if (!match || typeof match !== 'object' || Array.isArray(match)) {
       throw new TypeError(`${source}[${index}].match must be an object`);
     }
-
     if (!set || typeof set !== 'object' || Array.isArray(set)) {
       throw new TypeError(`${source}[${index}].set must be an object`);
     }
@@ -203,18 +185,15 @@ function normalizeRule(rule, index, source) {
     return { match: { ...match }, set: { ...set } };
   }
 
-  // Backward-compatible flat rule schema.
+  // Legacy flat schema compatibility.
   const match = {};
   const set = {};
-
   for (const key of MATCH_FIELDS) {
     if (rule[key] !== undefined) match[key] = rule[key];
   }
-
   for (const key of SET_FIELDS) {
     if (rule[key] !== undefined) set[key] = rule[key];
   }
-
   return { match, set };
 }
 
@@ -222,7 +201,6 @@ function parseRulesPayload(value, source = 'rules') {
   if (value === undefined || value === null || value === '') return [];
 
   let parsed = value;
-
   if (typeof parsed === 'string') {
     try {
       parsed = JSON.parse(parsed);
@@ -241,7 +219,9 @@ function parseRulesPayload(value, source = 'rules') {
   }
 
   if (!Array.isArray(parsed)) {
-    throw new TypeError(`${source} must be a JSON array or an object containing a rules array`);
+    throw new TypeError(
+      `${source} must be a JSON array or an object containing a rules array`
+    );
   }
 
   return parsed.map((rule, index) => normalizeRule(rule, index, source));
@@ -259,7 +239,9 @@ async function loadRulesFromUrl() {
     throw new Error('rulesUrl requires $substore.http.get in this Sub-Store runtime');
   }
 
-  const timeout = parseFloat(options.rulesTimeout ?? options.rules_timeout ?? 10000);
+  const timeout = parseFloat(
+    options.rulesTimeout ?? options.rules_timeout ?? 10000
+  );
   const response = await $substore.http.get({ url, timeout });
   const status = parseInt(response?.status ?? response?.statusCode ?? 200);
 
@@ -267,8 +249,7 @@ async function loadRulesFromUrl() {
     throw new Error(`rulesUrl request failed with HTTP ${status}`);
   }
 
-  const body = response?.body ?? '';
-  return parseRulesPayload(body, 'rulesUrl');
+  return parseRulesPayload(response?.body ?? '', 'rulesUrl');
 }
 
 function matchString(actual, expected, normalizer = normalizeLower) {
@@ -276,13 +257,13 @@ function matchString(actual, expected, normalizer = normalizeLower) {
 
   const actualValue = normalizer(actual);
   const expectedValues = Array.isArray(expected) ? expected : [expected];
-
-  return expectedValues.some((candidate) => actualValue === normalizer(candidate));
+  return expectedValues.some(
+    (candidate) => actualValue === normalizer(candidate)
+  );
 }
 
 function matchRegex(actual, pattern) {
   if (pattern === undefined || pattern === null || pattern === '') return true;
-
   try {
     return new RegExp(String(pattern), 'i').test(String(actual ?? ''));
   } catch (error) {
@@ -314,8 +295,10 @@ function applyRule(meta, rule) {
     }
   }
 
-  if (set.region !== undefined && set.region !== null && set.region !== '') {
-    next.region = normalizeUpper(set.region);
+  for (const key of ['region', 'city']) {
+    if (set[key] !== undefined && set[key] !== null && set[key] !== '') {
+      next[key] = normalizeUpper(set[key]);
+    }
   }
 
   if (set.asn !== undefined && set.asn !== null && set.asn !== '') {
@@ -329,13 +312,11 @@ function createMmdb() {
   const countryPath =
     String(options.mmdb_country_path ?? '').trim() ||
     getEnvironment('SUB_STORE_MMDB_COUNTRY_PATH');
-
   const asnPath =
     String(options.mmdb_asn_path ?? '').trim() ||
     getEnvironment('SUB_STORE_MMDB_ASN_PATH');
 
   if (!countryPath && !asnPath) return null;
-
   if (
     typeof ProxyUtils === 'undefined' ||
     typeof ProxyUtils.MMDB !== 'function'
@@ -350,9 +331,7 @@ function createMmdb() {
 }
 
 function enrichFromMmdb(meta, proxy, mmdb) {
-  if (!mmdb || !isIpAddress(String(proxy?.server ?? ''))) {
-    return meta;
-  }
+  if (!mmdb || !isIpAddress(String(proxy?.server ?? ''))) return meta;
 
   const ip = String(proxy.server).trim();
   const next = { ...meta };
@@ -381,13 +360,16 @@ function enrichFromMmdb(meta, proxy, mmdb) {
 function matchesAny(actual, requested, normalizer = normalizeLower) {
   if (!requested.length) return true;
   const normalizedActual = normalizer(actual);
-  return requested.some((item) => normalizedActual === normalizer(item));
+  return requested.some(
+    (item) => normalizedActual === normalizer(item)
+  );
 }
 
 const requestedProfiles = list(options.profile).map(normalizeLower);
 const requestedRoutes = list(options.route).map(normalizeLower);
 const requestedTraffic = list(options.traffic).map(normalizeLower);
 const requestedRegions = list(options.region).map(normalizeUpper);
+const requestedCities = list(options.city).map(normalizeUpper);
 const requestedProviders = list(options.provider).map(normalizeLower);
 const requestedAsns = list(options.asn).map(normalizeAsn);
 const requestedHosts = list(options.host).map(normalizeHost);
@@ -400,6 +382,7 @@ function classify(proxy, rules, mmdb) {
     route: '',
     traffic: '',
     region: '',
+    city: '',
     asn: '',
     aso: '',
     profile: '',
@@ -418,7 +401,6 @@ function profileMatches(meta) {
   if (!requestedProfiles.length || requestedProfiles.includes('all')) {
     return true;
   }
-
   return matchesAny(meta.profile, requestedProfiles);
 }
 
@@ -428,6 +410,7 @@ function shouldKeep(meta) {
     matchesAny(meta.route, requestedRoutes) &&
     matchesAny(meta.traffic, requestedTraffic) &&
     matchesAny(meta.region, requestedRegions, normalizeUpper) &&
+    matchesAny(meta.city, requestedCities, normalizeUpper) &&
     matchesAny(meta.provider, requestedProviders) &&
     matchesAny(meta.asn, requestedAsns, normalizeAsn) &&
     matchesAny(meta.host, requestedHosts, normalizeHost)
@@ -446,22 +429,16 @@ async function operator(proxies = []) {
 
   return proxies.flatMap((proxy) => {
     const meta = classify(proxy, rules, mmdb);
-
-    if (!shouldKeep(meta)) {
-      return [];
-    }
+    if (!shouldKeep(meta)) return [];
 
     const result = { ...proxy };
-
     if (keepMetadata) {
       result._nodeProfile = meta;
     } else {
       delete result._nodeProfile;
     }
 
-    // `_originServer` only bridges the DNS Resolve boundary.
     delete result._originServer;
-
     return [result];
   });
 }

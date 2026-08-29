@@ -1,0 +1,54 @@
+[
+  {
+    "match": {
+      "host": "bwh.haoqi90.top"
+    },
+    "set": {
+      "provider": "bwh",
+      "route": "optimized",
+      "traffic": "low",
+      "profile": "premium",
+      "region": "US",
+      "city": "LA"
+    }
+  },
+  {
+    "match": {
+      "host": "nosla.haoqi90.top"
+    },
+    "set": {
+      "provider": "nosla",
+      "route": "optimized",
+      "traffic": "high",
+      "profile": "main",
+      "region": "DE",
+      "city": "FRA"
+    }
+  },
+  {
+    "match": {
+      "host": "lightlayer.haoqi90.top"
+    },
+    "set": {
+      "provider": "lightlayer",
+      "route": "optimized",
+      "traffic": "medium",
+      "profile": "main",
+      "region": "US",
+      "city": "SJC"
+    }
+  },
+  {
+    "match": {
+      "host": "bitsflow.haoqi90.top"
+    },
+    "set": {
+      "provider": "bitsflow",
+      "route": "standard",
+      "traffic": "medium",
+      "profile": "backup",
+      "region": "JP",
+      "city": "TYO"
+    }
+  }
+]
