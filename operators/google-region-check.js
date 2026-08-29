@@ -134,6 +134,8 @@ function operator(proxies = []) {
     const result = { ...proxy };
     delete result._geo;
     delete result._googleStatus;
+    delete result._originServer;
+    delete result._nodeProfile;
 
     return [result];
   });

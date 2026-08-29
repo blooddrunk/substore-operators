@@ -6,11 +6,24 @@ Personal [Sub-Store](https://github.com/sub-store-org/Sub-Store) remote operator
 
 This repository keeps reusable Sub-Store scripts in Git so they can be versioned, reviewed, reused, and loaded directly as remote scripts.
 
+## Design goal
+
+The repository separates policy from runtime probing:
+
+- protocol, route quality, traffic/cost tier, region, and provider are static or semi-static policy;
+- Google region status is a dynamic probe;
+- sing-box / daed / Xray urltest or load balancing should only compare nodes that already belong to the same policy pool.
+
+This prevents a low-RTT but poor China-route node from defeating a better optimized route purely because its latency is lower.
+
 ## Operators
 
 ### `protocol-filter.js`
 
-Filters a 3x-ui subscription down to the proxy types used by this setup and preserves the original Hysteria2 TLS hostname before a later DNS-resolve action replaces `server` with an IP address.
+Filters a 3x-ui subscription to the proxy types used by this setup and, before DNS Resolve replaces `server` with an IP address:
+
+1. preserves the original Hysteria2 TLS hostname when no explicit SNI exists;
+2. stores the original hostname in temporary `_originServer` metadata so later policy filters can still identify the node reliably.
 
 Remote script URL:
 
@@ -28,193 +41,272 @@ Supported `filterType` values:
 | `hysteria2` | Hysteria2 only |
 | `hy2` | Alias of `hysteria2` |
 
-### `http-meta-geo.js`
+### `node-profile-filter.js`
 
-Forked from xream's `http_meta_geo.js`. It keeps the upstream general-purpose behavior and adds one compatibility change for this setup: **for Hysteria2 probes, `ports` is removed only from the temporary probe copy, forcing HTTP META to use the primary `port`. The original node and final subscription retain port hopping.**
+Filters nodes into policy pools before urltest / load balancing.
 
 Remote script URL:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/http-meta-geo.js
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js
 ```
+
+Supported filters:
+
+| Parameter | Example | Meaning |
+| --- | --- | --- |
+| `profile` | `main,premium` | Policy pool |
+| `route` | `optimized` | China-route class |
+| `traffic` | `high` | Traffic/cost tier |
+| `region` | `JP,US` | Server region |
+| `provider` | `nosla,bitsflow` | Host/route provider |
+| `asn` | `12345,AS67890` | Server ASN |
+| `host` | `nosla.example.com` | Original hostname |
+
+Values inside one field use OR; different fields use AND. Example:
+
+```text
+route=optimized&region=JP,SG
+```
+
+means “optimized China route AND located in Japan or Singapore”.
+
+Default profile derivation:
+
+```text
+main     = optimized + high traffic
+premium  = optimized + low traffic
+backup   = standard
+optimized = route=optimized
+standard  = route=standard
+```
+
+Only explicitly established route facts are built in:
+
+```text
+nosla.example.com    -> provider=nosla, route=optimized
+bitsflow.example.com -> provider=bitsflow, route=standard
+```
+
+Unknown route/traffic properties remain unknown; ASN, country, and latency are never used to guess “China optimized”.
+
+#### Custom rules
+
+Pass a JSON array through `rules`. Later rules override earlier rules, and user rules run after built-ins.
+
+Supported match fields:
+
+```text
+host
+hostRegex
+name
+nameRegex
+subName
+subNameRegex
+```
+
+Supported profile fields:
+
+```text
+provider
+route
+traffic
+region
+asn
+profile
+```
+
+Example:
+
+```json
+[
+  {
+    "host": "nosla.example.com",
+    "traffic": "low"
+  },
+  {
+    "host": "lightlayer.example.com",
+    "provider": "lightlayer",
+    "route": "optimized",
+    "traffic": "high"
+  }
+]
+```
+
+URL-encode the JSON when passing it in a remote-script fragment.
+
+#### MMDB server geography / ASN
+
+Node.js Sub-Store can use local MMDB files:
+
+```yaml
+services:
+  sub-store:
+    environment:
+      SUB_STORE_MMDB_CRON: 0 15 * * *
+      SUB_STORE_MMDB_COUNTRY_URL: https://github.com/xream/geoip/releases/latest/download/ipinfo.country.mmdb
+      SUB_STORE_MMDB_COUNTRY_PATH: /opt/app/data/GeoLite2-Country.mmdb
+      SUB_STORE_MMDB_ASN_URL: https://github.com/xream/geoip/releases/latest/download/ipinfo.asn.mmdb
+      SUB_STORE_MMDB_ASN_PATH: /opt/app/data/GeoLite2-ASN.mmdb
+    volumes:
+      - ./data:/opt/app/data
+```
+
+> A fresh install with no MMDB file does not automatically download one immediately; prepare the file first or wait for the configured cron run.
+
+After DNS Resolve, `node-profile-filter.js` queries the final `proxy.server` IP directly with local MMDB:
+
+```text
+server IP -> Country / ASN / AS Organization
+```
+
+No HTTP META instance is required for this server-side classification. Paths can also be overridden with:
+
+```text
+mmdb_country_path=/path/to/country.mmdb
+mmdb_asn_path=/path/to/asn.mmdb
+```
+
+Country/ASN are objective metadata only. They are not treated as proof of an optimized China route.
+
+For diagnostics, enable:
+
+```text
+metadata=true
+```
+
+which temporarily attaches `_nodeProfile`. The final Google filter also removes `_nodeProfile` and `_originServer` defensively.
+
+### `http-meta-geo.js`
+
+Forked from xream's `http_meta_geo.js`. It preserves upstream behavior and removes Hysteria2 `ports` only from the temporary probe copy so HTTP META uses the primary `port`; the original node and final subscription keep port hopping intact.
+
+It is appropriate when you need the real proxy egress Country/ASN. By contrast, `node-profile-filter.js` MMDB classification describes the DNS-resolved server IP itself.
 
 ### `google-region-probe.js`
 
-The recommended Google-region probe for this repository.
+The recommended Google-region probe. It creates a local HTTP META / Mihomo proxy per node and uses container `curl` to request YouTube Premium.
 
-It creates one local HTTP META / Mihomo proxy per node and then uses the container's `curl` binary to request:
-
-```text
-https://www.youtube.com/premium
-```
-
-Behavior:
-
-- Reality and Hysteria2 traffic is sent through the actual node via HTTP META.
-- Hysteria2 `ports` is removed only from the temporary probe copy.
-- curl does not automatically follow redirects, avoiding YouTube consent redirect loops on European exits.
-- A 2xx body containing `www.google.cn` is classified `cn`.
-- An explicit non-CN consent region is classified `clean`.
-- Network failures or responses that cannot be classified reliably are `unknown`.
-- The result is attached as `_googleStatus=clean|cn|unknown` for the next operator.
-
-Remote script URL:
+Results are classified as:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-probe.js
+clean | cn | unknown
 ```
+
+and stored in `_googleStatus` for the next operator.
 
 ### `google-region-check.js`
 
-Filters nodes using `_googleStatus` from `google-region-probe.js`. If `_googleStatus` is absent, it keeps compatibility with the historical `_geo` + `www.google.cn` classifier.
+Filters `_googleStatus` and keeps compatibility with the historical `_geo` + `www.google.cn` marker.
 
-Remote script URL:
-
-```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js
-```
-
-Supported `googleStatus` values:
+Supported values:
 
 | Value | Result |
 | --- | --- |
-| `all` | Keep all nodes (default) |
-| `clean` | Keep only nodes explicitly classified clean |
+| `all` | Keep all nodes |
+| `clean` | Keep only confirmed clean nodes |
 | `ok` | Alias of `clean` |
-| `non-cn` | Keep every node except those explicitly classified `cn` (`clean + unknown`) |
-| `cn` | Keep only nodes explicitly classified `cn` |
+| `non-cn` | Keep `clean + unknown` |
+| `cn` | Keep only confirmed CN nodes |
 | `china` | Alias of `cn` |
-| `unknown` | Keep only nodes without a reliable probe result |
+| `unknown` | Keep only indeterminate nodes |
 
-Two useful production policies:
+It removes `_geo`, `_googleStatus`, `_originServer`, and `_nodeProfile` before final output.
 
-```text
-googleStatus=clean
-```
-
-Strict mode: only confirmed-clean nodes survive; transient probe failures are removed too.
-
-```text
-googleStatus=non-cn
-```
-
-Conservative exclusion mode: only confirmed `cn` nodes are removed, while `unknown` nodes survive transient probe failures.
-
-After filtering, `_geo` and `_googleStatus` are removed so probe-only metadata does not leak into the final subscription.
-
-> `www.google.cn` is a heuristic rather than an official Google API. Network failures must remain distinct from `cn`, so the `unknown` state is intentionally preserved.
-
-## Recommended Sub-Store pipeline
+## Recommended pipeline
 
 ```text
 3x-ui original subscription
         │
         ▼
 ┌──────────────────────────────┐
-│ ① protocol-filter.js         │
+│ 1 protocol-filter.js         │
 │                              │
-│ Filter VLESS / Hysteria2     │
-│ Preserve SNI before IP swap  │
+│ protocol filtering           │
+│ preserve HY2 SNI             │
+│ preserve _originServer       │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
-│ ② DNS Resolve Action         │
+│ 2 DNS Resolve Action         │
 │                              │
-│ Resolver: Cloudflare         │
-│ IP family: IPv4              │
-│ Output: IP only              │
-│ TLS verification: enabled    │
-│ Cache: 300–600 s             │
+│ hostname -> IPv4             │
+│ TLS validation enabled       │
+│ cache 300-600 s              │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
-│ ③ google-region-probe.js     │
+│ 3 node-profile-filter.js     │
 │                              │
-│ Probe the final server IP    │
+│ static: route / traffic      │
+│         provider / profile   │
+│ MMDB: region / ASN           │
+│                              │
+│ shrink the candidate pool    │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ 4 google-region-probe.js     │
+│                              │
+│ probe surviving nodes only   │
 │ clean / cn / unknown         │
-│ HY2 probe copy drops ports   │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
-│ ④ google-region-check.js     │
+│ 5 google-region-check.js     │
 │                              │
-│ Strict: clean                │
-│ Conservative: non-cn        │
-│ Remove probe metadata        │
+│ Google status filter         │
+│ clean temporary metadata     │
 └──────────────┬───────────────┘
                │
                ▼
-        subscription output
+      sing-box / daed / Xray
+               │
+               ▼
+       urltest / load balance
+       within the same tier
 ```
 
-### Why DNS resolution comes before the Google probe
+Putting node-profile filtering before HTTP META also avoids probing nodes that cannot enter the requested policy pool anyway.
 
-For this repository's use case, this order better matches the final subscription. The final node already replaces `server` with a resolved IP, so the Google probe should validate the same connection configuration that will actually be emitted and used.
+## Copy-ready examples
 
-If the Google probe runs against the hostname first and DNS Resolve runs afterward, a hostname with multiple A records, changing DNS state, or cache differences could theoretically be probed through one ingress IP while the final subscription is pinned to another.
-
-Recommended order:
+Optimized routes only:
 
 ```text
-protocol filter / preserve SNI
-    -> DNS Resolve
-    -> Google probe
-    -> Google filter
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#profile=optimized
 ```
 
-The important prerequisite is that **the TLS hostname must be preserved before DNS Resolve replaces `server` with an IP**. `protocol-filter.js` handles this for Hysteria2 nodes that do not already provide an explicit SNI. Existing Reality/VLESS TLS and Reality SNI fields are preserved as-is.
-
-## Copy-ready configuration
-
-### 1. Protocol filter
+Standard/backup routes:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/protocol-filter.js#filterType=all
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#profile=backup
 ```
 
-### 2. DNS resolution
-
-Continue with Cloudflare / IPv4 / IP-only / TLS-validation-enabled and a 300–600 second cache.
-
-### 3. Google probe
+Optimized Japan nodes:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-probe.js#http_meta_protocol=http&http_meta_host=127.0.0.1&http_meta_port=9876&http_meta_start_delay=3000&http_meta_proxy_timeout=10000&api=https%3A%2F%2Fwww.youtube.com%2Fpremium&concurrency=1&timeout=10000
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#route=optimized&region=JP
 ```
 
-### 4. Google filter
-
-Keep only explicitly clean nodes:
+Specific provider:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js#googleStatus=clean
+https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/node-profile-filter.js#provider=nosla
 ```
 
-Remove only explicitly `cn` nodes and keep `clean + unknown`:
+Use `profile=main` / `profile=premium` after the relevant hosts have an explicit `traffic` tier.
+
+The core rule is:
 
 ```text
-https://raw.githubusercontent.com/blooddrunk/substore-operators/main/operators/google-region-check.js#googleStatus=non-cn
+Profile chooses the candidate pool.
+URLTest chooses the current winner inside that pool.
 ```
-
-Diagnostics:
-
-```text
-googleStatus=cn
-googleStatus=unknown
-googleStatus=all
-```
-
-## Hysteria2 SNI and port hopping
-
-These are handled at different stages:
-
-- `protocol-filter.js` preserves SNI before DNS resolution replaces the hostname.
-- `google-region-probe.js` / `http-meta-geo.js` removes `ports` only from the HTTP META probe copy to work around probe-time port-hopping compatibility.
-
-The final Hysteria2 node still keeps its real `port`, `ports`, and `sni` fields.
 
 ## Repository layout
 
@@ -224,20 +316,17 @@ The final Hysteria2 node still keeps its real `port`, `ports`, and `sni` fields.
 ├── README.zh-CN.md
 └── operators/
     ├── protocol-filter.js
+    ├── node-profile-filter.js
     ├── http-meta-geo.js
     ├── google-region-probe.js
     └── google-region-check.js
 ```
 
-## Development conventions
+## Maintenance principles
 
-- Keep remote scripts self-contained where practical; document any system-tool runtime requirement.
-- Prefer explicit defaults and documented aliases.
-- Preserve existing proxy fields unless a transformation is required.
-- Treat network-based detection as fallible and retain an `unknown` state.
-- Remove probe-only metadata before final subscription output.
-- Keep stable filenames once they are referenced by Sub-Store remote-script URLs.
-
-## Upstream
-
-Sub-Store's Script Operator expects an `operator(proxies)` function and exposes `$arguments` / `$options` to the script runtime. This repository follows that model.
+- Do not infer China-route quality from RTT.
+- Do not infer “optimized” from Country/ASN.
+- Leave unknown route attributes unknown.
+- User rules override built-ins.
+- Dynamic network probes keep an explicit `unknown` state.
+- Remove temporary metadata before final subscription output.

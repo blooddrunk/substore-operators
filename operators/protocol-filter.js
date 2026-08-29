@@ -9,6 +9,10 @@
  * hysteria2  - Hysteria2 only
  * hy2        - alias of hysteria2
  *
+ * This operator runs before DNS Resolve. When `server` is a hostname it is
+ * copied to `_originServer` so later operators can still classify the node by
+ * its stable hostname after DNS Resolve pins `server` to an IP address.
+ *
  * Parameter priority:
  * $options > $arguments > defaults
  */
@@ -126,6 +130,25 @@ function isIpAddress(value) {
 }
 
 /**
+ * Preserve the pre-DNS hostname for profile/provider matching later.
+ */
+function preserveOriginServer(proxy) {
+  const server =
+    typeof proxy?.server === 'string'
+      ? proxy.server.trim()
+      : '';
+
+  if (!server || isIpAddress(server) || proxy._originServer) {
+    return proxy;
+  }
+
+  return {
+    ...proxy,
+    _originServer: server,
+  };
+}
+
+/**
  * Before a later DNS Resolve Action changes `server` from hostname to IP,
  * preserve the original hostname as Hysteria2 SNI when no explicit TLS
  * hostname is already configured.
@@ -161,5 +184,6 @@ function operator(proxies = []) {
 
   return proxies
     .filter(shouldKeep)
+    .map(preserveOriginServer)
     .map(ensureHysteria2Sni);
 }
