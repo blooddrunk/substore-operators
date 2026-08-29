@@ -1,0 +1,3 @@
+# 部署实例文件，含订阅地址/节点信息，不入库（模板见 *.example.*）
+configs/keepwarm.sh
+configs/node-profile-rules.json
