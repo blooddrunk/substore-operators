@@ -92,7 +92,9 @@ function toBoolean(value, fallback = false) {
   return /^(1|true|yes|on)$/i.test(String(value).trim());
 }
 
-function list(value) {
+// Do not name this helper `list`: Sub-Store's quick-script runner owns a
+// `let list = []` variable and later calls list.push($server).
+function parseCsvList(value) {
   if (value === undefined || value === null || value === '') return [];
   return String(value)
     .split(',')
@@ -116,6 +118,26 @@ function normalizeAsn(value) {
   const raw = normalizeUpper(value);
   if (!raw) return '';
   return raw.startsWith('AS') ? raw.slice(2) : raw;
+}
+
+function normalizeRulesUrl(value) {
+  let url = String(value ?? '').trim();
+  if (!url) return '';
+
+  // Depending on how the Script Operator arguments were entered, Sub-Store may
+  // expose either the decoded URL or the percent-encoded fragment value.
+  if (!/^https?:\/\//i.test(url)) {
+    try {
+      const decoded = decodeURIComponent(url).trim();
+      if (decoded) url = decoded;
+    } catch (_) {}
+  }
+
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error(`Invalid rulesUrl: ${url}`);
+  }
+
+  return url;
 }
 
 function isIpAddress(value) {
@@ -282,7 +304,7 @@ function writeRulesCache(url, body) {
 }
 
 async function loadRulesFromUrl() {
-  const url = String(options.rulesUrl ?? options.rules_url ?? '').trim();
+  const url = normalizeRulesUrl(options.rulesUrl ?? options.rules_url ?? '');
   if (!url) return [];
 
   if (
@@ -311,7 +333,7 @@ async function loadRulesFromUrl() {
     const status = parseInt(response?.status ?? response?.statusCode ?? 200);
 
     if (status < 200 || status >= 300) {
-      throw new Error(`rulesUrl request failed with HTTP ${status}`);
+      throw new Error(`rulesUrl request failed with HTTP ${status}: ${url}`);
     }
 
     const body = response?.body ?? '';
@@ -444,14 +466,14 @@ function matchesAny(actual, requested, normalizer = normalizeLower) {
   );
 }
 
-const requestedProfiles = list(options.profile).map(normalizeLower);
-const requestedRoutes = list(options.route).map(normalizeLower);
-const requestedTraffic = list(options.traffic).map(normalizeLower);
-const requestedRegions = list(options.region).map(normalizeUpper);
-const requestedCities = list(options.city).map(normalizeUpper);
-const requestedProviders = list(options.provider).map(normalizeLower);
-const requestedAsns = list(options.asn).map(normalizeAsn);
-const requestedHosts = list(options.host).map(normalizeHost);
+const requestedProfiles = parseCsvList(options.profile).map(normalizeLower);
+const requestedRoutes = parseCsvList(options.route).map(normalizeLower);
+const requestedTraffic = parseCsvList(options.traffic).map(normalizeLower);
+const requestedRegions = parseCsvList(options.region).map(normalizeUpper);
+const requestedCities = parseCsvList(options.city).map(normalizeUpper);
+const requestedProviders = parseCsvList(options.provider).map(normalizeLower);
+const requestedAsns = parseCsvList(options.asn).map(normalizeAsn);
+const requestedHosts = parseCsvList(options.host).map(normalizeHost);
 const keepMetadata = toBoolean(options.metadata, false);
 
 function classify(proxy, rules, mmdb) {
