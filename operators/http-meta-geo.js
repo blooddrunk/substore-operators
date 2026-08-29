@@ -1,11 +1,53 @@
 /**
- * Forked from xream/scripts:
- * https://github.com/xream/scripts/blob/main/surge/modules/sub-store-scripts/check/http_meta_geo.js
  *
- * Local modification:
- * - For Hysteria2 probes only, remove `ports` from the temporary proxy copy before
- *   converting it to ClashMeta. This keeps the original subscription node unchanged
- *   while forcing HTTP META to probe the node through its primary `port`.
+ * 节点信息(适配 Sub-Store Node.js 版)
+ * 
+ * App 版请使用 geo.js
+ *
+ * 查看说明: https://t.me/zhetengsha/1269
+ *
+ * 欢迎加入 Telegram 群组 https://t.me/zhetengsha
+ *
+ * HTTP META(https://github.com/xream/http-meta) 参数
+ * - [http_meta_protocol] 协议 默认: http
+ * - [http_meta_host] 服务地址 默认: 127.0.0.1
+ * - [http_meta_port] 端口号 默认: 9876
+ * - [http_meta_authorization] Authorization 默认无
+ * - [http_meta_start_delay] 初始启动延时(单位: 毫秒) 默认: 3000
+ * - [http_meta_proxy_timeout] 每个节点耗时(单位: 毫秒). 此参数是为了防止脚本异常退出未关闭核心. 设置过小将导致核心过早退出. 目前逻辑: 启动初始的延时 + 每个节点耗时. 默认: 10000
+ *
+ * 其它参数
+ * - [retries] 重试次数 默认 1
+ * - [retry_delay] 重试延时(单位: 毫秒) 默认 1000
+ * - [concurrency] 并发数 默认 10
+ * - [timeout] 请求超时(单位: 毫秒) 默认 5000
+ * - [internal] 使用内部方法获取 IP 信息. 默认 false
+                设置环境变量 SUB_STORE_MMDB_COUNTRY_PATH 和 SUB_STORE_MMDB_ASN_PATH, 或 传入 mmdb_country_path 和 mmdb_asn_path 参数(分别为 MaxMind GeoLite2 Country 和 GeoLite2 ASN 数据库 的路径)
+*              数据来自 GeoIP 数据库
+*              (因为懒) 开启后, 将认为远程 API 返回的响应内容为纯文本 IP 地址, 并用于内部方法
+ * - [method] 请求方法. 默认 get
+ * - [api] 测落地的 API . 默认为 http://ip-api.com/json?lang=zh-CN
+ *         当使用 internal 时, 默认为 http://checkip.amazonaws.com
+ * - [format] 自定义格式, 从 节点(proxy) 和 API 响应(api) 中取数据. 默认为: {{api.country}} {{api.isp}} - {{proxy.name}}
+ *            当使用 internal 时, 默认为 {{api.countryCode}} {{api.aso}} - {{proxy.name}}
+ * - [regex] 使用正则表达式从落地 API 响应(api)中取数据. 格式为 a:x;b:y 此时将使用正则表达式 x 和 y 来从 api 中取数据, 赋值给 a 和 b. 然后可在 format 中使用 {{api.a}} 和 {{api.b}}
+ * - [geo] 在节点上附加 _geo 字段, 默认不附加
+ * - [include_unsupported_proxy] 传递给运行环境时, 包含官方/商店版不支持的协议. 默认不包含. 若开启, 需要保证你的运行环境确实支持这些协议, 不然会报错
+ * - [incompatible] 在节点上附加 _incompatible 字段来标记当前客户端不兼容该协议, 默认不附加
+ * - [remove_incompatible] 移除当前客户端不兼容的协议. 默认不移除.
+ * - [remove_failed] 移除失败的节点. 默认不移除.
+ * - [mmdb_country_path] 见 internal
+ * - [mmdb_asn_path] 见 internal
+ * - [cache] 使用缓存. 默认不使用缓存
+ * - [disable_failed_cache/ignore_failed_error] 禁用失败缓存. 即不缓存失败结果
+ * 关于缓存时长
+ * 当使用相关脚本时, 若在对应的脚本中使用参数(⚠ 别忘了这个, 一般为 cache, 值设为 true 即可)开启缓存
+ * 可在前端(>=2.16.0) 配置各项缓存的默认时长
+ * 持久化缓存数据在 JSON 里
+ * 可以在脚本的前面添加一个脚本操作, 实现保留 1 小时的缓存. 这样比较灵活
+ * async function operator() {
+ *     scriptResourceCache._cleanup(undefined, 1 * 3600 * 1000);
+ * }
  */
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -47,13 +89,10 @@ async function operator(proxies = [], targetPlatform, context) {
   const internalProxies = []
   proxies.map((proxy, index) => {
     try {
-      // Probe-only copy: keep the original node untouched.
+      // Local fork: only alter the temporary probe copy. The original subscription
+      // keeps Hysteria2 `ports`, while HTTP META probes through the primary `port`.
       const probeProxy = { ...proxy }
-
-      // Hysteria2 port hopping is part of the real subscription, but for HTTP META
-      // probing we intentionally force the primary port. This removes `ports` only
-      // from the temporary copy that is sent to Mihomo.
-      if (String(probeProxy.type || '').toLowerCase() === 'hysteria2' && probeProxy.ports) {
+      if (String(probeProxy.type || '').toLowerCase() === 'hysteria2') {
         delete probeProxy.ports
       }
 
@@ -66,6 +105,7 @@ async function operator(proxies = [], targetPlatform, context) {
             node[key] = proxy[key]
           }
         }
+        // $.info(JSON.stringify(node, null, 2))
         internalProxies.push({ ...node, _proxies_index: index })
       } else {
         proxies[index]._incompatible = true
@@ -74,6 +114,7 @@ async function operator(proxies = [], targetPlatform, context) {
       $.error(e)
     }
   })
+  // $.info(JSON.stringify(internalProxies, null, 2))
   $.info(`核心支持节点数: ${internalProxies.length}/${proxies.length}`)
   if (!internalProxies.length) return proxies
 
@@ -116,6 +157,7 @@ async function operator(proxies = [], targetPlatform, context) {
   let http_meta_pid
   let http_meta_ports = []
 
+  // 启动 HTTP META
   const res = await http({
     retries: 0,
     method: 'post',
@@ -147,12 +189,21 @@ async function operator(proxies = [], targetPlatform, context) {
   $.info(`等待 ${http_meta_start_delay / 1000} 秒后开始检测`)
   await $.wait(http_meta_start_delay)
 
-  const concurrency = parseInt($arguments.concurrency || 10)
+  const concurrency = parseInt($arguments.concurrency || 10) // 一组并发数
   await executeAsyncTasks(
     internalProxies.map(proxy => () => check(proxy)),
     { concurrency }
   )
+  // const batches = []
+  // for (let i = 0; i < internalProxies.length; i += concurrency) {
+  //   const batch = internalProxies.slice(i, i + concurrency)
+  //   batches.push(batch)
+  // }
+  // for (const batch of batches) {
+  //   await Promise.all(batch.map(check))
+  // }
 
+  // stop http meta
   try {
     const res = await http({
       method: 'post',
@@ -196,7 +247,10 @@ async function operator(proxies = [], targetPlatform, context) {
   return proxies
 
   async function check(proxy) {
+    // $.info(`[${proxy.name}] 检测`)
+    // $.info(`检测 ${JSON.stringify(proxy, null, 2)}`)
     const id = cacheEnabled ? getCacheId({ proxy, url, format, regex }) : undefined
+    // $.info(`检测 ${id}`)
     try {
       const cached = cache.get(id)
       if (cacheEnabled && cached) {
@@ -220,7 +274,7 @@ async function operator(proxies = [], targetPlatform, context) {
           }
         }
       }
-
+      // $.info(JSON.stringify(proxy, null, 2))
       const index = internalProxies.indexOf(proxy)
       const startedAt = Date.now()
 
@@ -235,7 +289,8 @@ async function operator(proxies = [], targetPlatform, context) {
       })
       let api = String(lodash_get(res, 'body'))
       const status = parseInt(res.status || res.statusCode || 200)
-      let latency = `${Date.now() - startedAt}`
+      let latency = ''
+      latency = `${Date.now() - startedAt}`
       $.info(`[${proxy.name}] status: ${status}, latency: ${latency}`)
       if (internal) {
         const ip = api.trim()
@@ -273,7 +328,7 @@ async function operator(proxies = [], targetPlatform, context) {
       }
     }
   }
-
+  // 请求
   async function http(opt = {}) {
     const METHOD = opt.method || $arguments.method || 'get'
     const TIMEOUT = parseFloat(opt.timeout || $arguments.timeout || 5000)
@@ -285,9 +340,11 @@ async function operator(proxies = [], targetPlatform, context) {
       try {
         return await $.http[METHOD]({ ...opt, timeout: TIMEOUT })
       } catch (e) {
+        // $.error(e)
         if (count < RETRIES) {
           count++
           const delay = RETRY_DELAY * count
+          // $.info(`第 ${count} 次请求失败: ${e.message || e}, 等待 ${delay / 1000}s 后重试`)
           await $.wait(delay)
           return await fn()
         } else {
@@ -297,70 +354,82 @@ async function operator(proxies = [], targetPlatform, context) {
     }
     return await fn()
   }
-
-  function lodash_get(obj, path, defaultValue) {
-    const keys = Array.isArray(path)
-      ? path
-      : String(path)
-          .replace(/\[(\d+)\]/g, '.$1')
-          .replace(/^\./, '')
-          .split('.')
-    let result = obj
-    for (const key of keys) {
-      if (result == null || !(key in Object(result))) return defaultValue
-      result = result[key]
+  function lodash_get(source, path, defaultValue = undefined) {
+    const paths = path.replace(/\[(\d+)\]/g, '.$1').split('.')
+    let result = source
+    for (const p of paths) {
+      result = Object(result)[p]
+      if (result === undefined) {
+        return defaultValue
+      }
     }
-    return result === undefined ? defaultValue : result
+    return result
   }
-
-  function formatter({ proxy, api, format, regex }) {
-    let apiData = api
+  function formatter({ proxy = {}, api = {}, format = '', regex = '' }) {
     if (regex) {
-      apiData = {}
-      const rules = String(regex).split(';')
-      for (const rule of rules) {
-        const index = rule.indexOf(':')
-        if (index <= 0) continue
-        const key = rule.slice(0, index)
-        const pattern = rule.slice(index + 1)
-        try {
-          const match = String(api).match(new RegExp(pattern))
-          apiData[key] = match?.[1] ?? match?.[0] ?? ''
-        } catch (e) {
-          apiData[key] = ''
+      const regexPairs = regex.split(/\s*;\s*/g).filter(Boolean)
+      const extracted = {}
+      for (const pair of regexPairs) {
+        const [key, pattern] = pair.split(/\s*:\s*/g).map(s => s.trim())
+        if (key && pattern) {
+          try {
+            const reg = new RegExp(pattern)
+            extracted[key] = (typeof api === 'string' ? api : JSON.stringify(api)).match(reg)?.[1]?.trim()
+          } catch (e) {
+            $.error(`正则表达式解析错误: ${e.message}`)
+          }
         }
       }
+      api = { ...api, ...extracted }
     }
-
-    return String(format).replace(/{{\s*([^{}]+?)\s*}}/g, (_, expression) => {
-      const [scope, ...rest] = expression.trim().split('.')
-      const keyPath = rest.join('.')
-      if (scope === 'proxy') return lodash_get(proxy, keyPath, '')
-      if (scope === 'api') return lodash_get(apiData, keyPath, '')
-      return ''
-    })
+    let f = format.replace(/\{\{(.*?)\}\}/g, '${$1}')
+    return eval(`\`${f}\``)
   }
-
-  function getCacheId({ proxy, url, format, regex }) {
-    return JSON.stringify({
-      proxy,
-      url,
-      format,
-      regex,
-    })
+  function getCacheId({ proxy = {}, url, format, regex }) {
+    return `http-meta:geo:${url}:${format}:${regex}:${internal}:${JSON.stringify(
+      Object.fromEntries(Object.entries(proxy).filter(([key]) => !/^(collectionName|subName|id|_.*)$/i.test(key)))
+    )}`
   }
+  function executeAsyncTasks(tasks, { wrap, result, concurrency = 1 } = {}) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        let running = 0
+        const results = []
 
-  async function executeAsyncTasks(tasks = [], options = {}) {
-    const concurrency = Math.max(1, parseInt(options.concurrency || 1))
-    let cursor = 0
+        let index = 0
 
-    const worker = async () => {
-      while (cursor < tasks.length) {
-        const index = cursor++
-        await tasks[index]()
+        function executeNextTask() {
+          while (index < tasks.length && running < concurrency) {
+            const taskIndex = index++
+            const currentTask = tasks[taskIndex]
+            running++
+
+            currentTask()
+              .then(data => {
+                if (result) {
+                  results[taskIndex] = wrap ? { data } : data
+                }
+              })
+              .catch(error => {
+                if (result) {
+                  results[taskIndex] = wrap ? { error } : error
+                }
+              })
+              .finally(() => {
+                running--
+                executeNextTask()
+              })
+          }
+
+          if (running === 0) {
+            return resolve(result ? results : undefined)
+          }
+        }
+
+        await executeNextTask()
+      } catch (e) {
+        reject(e)
       }
-    }
-
-    await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()))
+    })
   }
 }
