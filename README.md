@@ -382,7 +382,7 @@ Get "https://<后端>/download/...": context deadline exceeded
 | --- | --- | --- |
 | 1 | Operator | `unknown` 结果短 TTL 缓存（默认行为）+ 探测异常回退 stale 缓存，压缩冷生产耗时 |
 | 2 | 反代 | openresty / Nginx `proxy_cache` + stale-while-revalidate，预热后毫秒级响应，上游慢或瞬时 5xx 不透传 |
-| 3 | 保热 | cron 每 5 分钟刷新缓存，daed 的定时任务永远命中热缓存 |
+| 3 | 保热 | cron 默认每小时刷新缓存（自愈 + 变更后换新），daed 的定时任务永远命中热缓存 |
 
 同时建议把探测操作的 `http_meta_start_delay` 设为 `1500`（`3000` 一项就占掉 5 秒预算的 60%），并保留 `share_by_server=true`：
 
@@ -418,13 +418,37 @@ curl -sI 'https://<后端域名>/<路径标识>/download/<订阅名>' | grep -i 
 
 ### 部署保热 cron
 
+脚本 [configs/keepwarm.sh](./configs/keepwarm.sh) 自带 install / status / uninstall 子命令，会自我安装；个人配置（下载地址前缀、保热路径列表、缓存目录）全部放在外部 conf 文件里，脚本本身不含隐私信息、直接入库：
+
 ```bash
-cp configs/keepwarm.example.sh configs/keepwarm.sh   # 编辑：填入 BASE 与所有需要保热的下载路径
-cp configs/keepwarm.sh /usr/local/bin/substore-keepwarm.sh && chmod +x /usr/local/bin/substore-keepwarm.sh
-( crontab -l; echo '*/5 * * * * /usr/local/bin/substore-keepwarm.sh >/dev/null 2>&1' ) | crontab -
+cd configs
+cp keepwarm.example.conf keepwarm.conf  # 编辑：填入 BASE 与所有需要保热的下载路径
+sh keepwarm.sh install                  # 安装脚本与 conf，写入 cron（默认 0 * * * *，每小时）
+sh keepwarm.sh status                   # 查看 conf / cron 条目 / 已安装文件 / 缓存目录占用
 ```
 
-`keepwarm.sh` 含真实订阅地址，已被 `.gitignore` 排除，不要提交。URL 列表必须覆盖客户端定时拉取的**每一个**下载 URL（包括不同 `$options` 变体），因为缓存 key 包含完整 URI。
+`keepwarm.conf` 含真实订阅地址，已被 `.gitignore` 排除，不要提交。路径列表必须覆盖客户端定时拉取的**每一个**下载 URL（包括不同 `$options` 变体），因为缓存 key 包含完整 URI。
+
+为什么默认每小时就够：让 daed 稳定成功的是反代的 stale-while-revalidate——条目过期但仍在 `inactive=7d` 窗口内时，nginx 立即回旧值、后台刷新。保热 cron 只负责两件事：缓存被清空/首次部署后一小时内自愈（否则冷生产 5~7 秒会让 daed 每 6 小时必败，且失败不留下任何缓存，不会自愈）；你主动变更订阅后一小时内换新缓存。对静态自管节点，每小时已覆盖这两个需求，频率硬上限是 `inactive=7d`。
+
+#### 更新保热 URL 与 cron 频率
+
+- **增删订阅（URL 列表）**：直接编辑已安装的 `/usr/local/etc/substore-keepwarm.conf`，下次运行即生效，无需重新安装；或改仓库 `configs/keepwarm.conf` 后执行 `sh keepwarm.sh install` 覆盖安装。`sh keepwarm.sh run` 可立即手动预热一遍验证新 URL。
+- **调整频率**：`sh keepwarm.sh install '*/30 * * * *'`。install 是幂等的：总会用当前脚本与 conf 覆盖安装，并替换引用该安装路径的旧 cron 条目（表达式记得加引号，避免 `*` 被 shell 展开；脚本会校验必须是「分 时 日 月 周」5 个字段）。
+
+#### 清理副作用（卸载）
+
+保热的副作用共四处：crontab 条目、`/usr/local/bin/substore-keepwarm.sh`、`/usr/local/etc/substore-keepwarm.conf`、反代缓存目录中被预热的条目。
+
+```bash
+sh keepwarm.sh uninstall                # 移除 cron 条目 + 删除已安装脚本与 conf
+sh keepwarm.sh uninstall --purge-cache  # 同时清空反代缓存目录（conf 里的 CACHE_DIR）
+```
+
+- `--purge-cache` 从 conf 读取 `CACHE_DIR`（宿主机路径；1Panel openresty 为 `/opt/1panel/www/cache/substore`）。直接删除缓存文件即可，nginx 无需 reload，缺失文件按 MISS 处理。
+- 按旧文档手动 `cp` + `crontab -e` 安装的同样这样清理：条目按安装路径匹配，`/usr/local/bin/substore-keepwarm.sh` 的旧条目会被一并移除。
+- Sub-Store 后端的探测缓存 / 规则缓存按各自 TTL 自行过期，无需（也无法从外部）清理。
+- 若只想清缓存、保留保热，清完执行 `sh keepwarm.sh run` 立即重新预热，避免下次拉取冷启动。
 
 ## Troubleshooting
 
@@ -476,7 +500,7 @@ daed 单次尝试硬编码 5 秒超时且不可配置。按 [VPS 生产部署](#
 
 ### 每次拉取都要 5~6 秒，`X-Cache-Status` 一直是 `MISS`
 
-- 保热 cron 没装或没跑：`crontab -l` 检查条目，手动执行脚本看报错。
+- 保热 cron 没装或没跑：`sh configs/keepwarm.sh status` 一键检查 cron 条目与已安装副本，或 `crontab -l` 直接看条目、手动执行脚本看报错。
 - 保热脚本的 URL 列表没有覆盖该下载地址：不同 `$options` 变体是独立缓存 key，需逐个列出。
 - 缓存目录不存在或无写权限：检查 nginx error log。
 
@@ -495,8 +519,9 @@ daed 单次尝试硬编码 5 秒超时且不可配置。按 [VPS 生产部署](#
 ├── README.md
 ├── configs/
 │   ├── README.md                        # 本目录说明
-│   ├── openresty-substore-cache.conf    # 反代下载缓存模板
-│   └── keepwarm.example.sh              # 缓存保热脚本模板（填写后的 keepwarm.sh 不入库）
+│   ├── keepwarm.sh                      # 缓存保热脚本，含 install/status/uninstall 子命令
+│   ├── keepwarm.example.conf            # 保热配置模板（实际的 keepwarm.conf 不入库）
+│   └── openresty-substore-cache.conf    # 反代下载缓存模板
 ├── examples/
 │   └── node-profile-rules.example.json  # 节点档案模板（实际的 node-profile-rules.json 不入库）
 └── operators/

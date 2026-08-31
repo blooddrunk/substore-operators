@@ -7,7 +7,8 @@
 | 文件 | 用途 |
 | --- | --- |
 | `openresty-substore-cache.conf` | Sub-Store 前置 openresty / Nginx 下载缓存模板，解决 daed 5 秒订阅更新超时。部署步骤见[主 README「VPS 生产部署与 daed 订阅超时」](../README.md#vps-生产部署与-daed-订阅超时)一节 |
-| `keepwarm.example.sh` | 缓存保热 cron 脚本模板。复制为 `keepwarm.sh` 并填入自己的前端路径与订阅下载路径（填写后的文件已 gitignore，不入库） |
+| `keepwarm.sh` | 缓存保热 cron 脚本，自带 install / status / uninstall 子命令（安装、更新 URL 与 cron 频率、清理副作用）。个人配置在外部 conf，脚本本身入库 |
+| `keepwarm.example.conf` | 保热配置模板：`BASE=`、`CACHE_DIR=` 与保热路径列表。复制为 `keepwarm.conf` 填入自己的值（已 gitignore，不入库） |
 
 ## 节点档案在哪
 
